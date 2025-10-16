@@ -1,0 +1,50 @@
+[
+  {
+    "id": "2001",
+    "name": "Another User",
+    "email": "a***@***.com",
+    "phone": "555-2222",
+    "riskLevel": "high",
+    "dateAdded": "2025-09-06"
+  },
+  {
+    "id": "3001",
+    "name": "File User",
+    "email": "f***@***.com",
+    "phone": "555-3333",
+    "riskLevel": "medium",
+    "dateAdded": "2025-09-06"
+  },
+  {
+    "id": "9001",
+    "name": "Multipart Test",
+    "email": "m***@***.com",
+    "phone": "555-9001",
+    "riskLevel": "medium",
+    "dateAdded": "2025-09-06"
+  },
+  {
+    "id": "9002",
+    "name": "JSON Test",
+    "email": "j***@***.com",
+    "phone": "555-9002",
+    "riskLevel": "high",
+    "dateAdded": "2025-09-06"
+  },
+  {
+    "id": "2001",
+    "name": "JSON Import",
+    "email": "a***@***.com",
+    "phone": "555-2222",
+    "riskLevel": "high",
+    "dateAdded": "2025-09-06"
+  },
+  {
+    "id": "2002",
+    "name": "File Import",
+    "email": "f***@***.com",
+    "phone": "555-3333",
+    "riskLevel": "medium",
+    "dateAdded": "2025-09-06"
+  }
+]

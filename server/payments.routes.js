@@ -1,0 +1,125 @@
+﻿// server/payments.routes.js  (ESM)
+import { Router } from "express";
+
+// -------- fetch polyfill for Node < 18 --------
+const hasFetch = typeof globalThis.fetch === "function";
+let fetchFn = globalThis.fetch;
+if (!hasFetch) {
+  const { default: nodeFetch } = await import("node-fetch");
+  fetchFn = nodeFetch;
+}
+
+const router = Router();
+
+/* -------------------------- PayPal config -------------------------- */
+const PAYPAL_MODE =
+  (process.env.PAYPAL_MODE || "sandbox").toLowerCase() === "live" ? "live" : "sandbox";
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "";
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET || "";
+
+const BASE =
+  PAYPAL_MODE === "live"
+    ? "https://api-m.paypal.com"
+    : "https://api-m.sandbox.paypal.com";
+
+if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
+  console.warn("⚠️  Missing PAYPAL_CLIENT_ID or PAYPAL_SECRET in server/.env");
+}
+
+/* ---------------------- helper: getAccessToken --------------------- */
+async function getAccessToken() {
+  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString("base64");
+  const res = await fetchFn(`${BASE}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`OAuth error ${res.status}: ${txt}`);
+  }
+  const data = await res.json();
+  return data.access_token;
+}
+
+/* --------------------------- Payments API -------------------------- */
+// POST /api/payments/create-order
+router.post("/create-order", async (req, res) => {
+  try {
+    const { amount, currency = "USD", label = "Support" } = req.body || {};
+    const n = Number(amount);
+    if (!Number.isFinite(n) || n <= 0) {
+      return res.status(400).json({ ok: false, error: "Invalid amount" });
+    }
+
+    const token = await getAccessToken();
+    const r = await fetchFn(`${BASE}/v2/checkout/orders`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        intent: "CAPTURE",
+        purchase_units: [
+          {
+            amount: { currency_code: currency, value: n.toFixed(2) },
+            description: label,
+          },
+        ],
+        application_context: {
+          brand_name: "GuardLeaks",
+          user_action: "PAY_NOW",
+          shipping_preference: "NO_SHIPPING",
+        },
+      }),
+    });
+
+    let j = null;
+    try { j = await r.json(); } catch {}
+    if (!r.ok || !j?.id) {
+      const msg = j?.message || (await r.text().catch(() => "")) || "Could not create order";
+      console.error("[PayPal] create-order failed:", r.status, msg);
+      return res.status(500).json({ ok: false, error: msg });
+    }
+    res.json({ ok: true, orderID: j.id });
+  } catch (e) {
+    console.error("create-order error:", e);
+    res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// POST /api/payments/capture-order
+router.post("/capture-order", async (req, res) => {
+  try {
+    const { orderID } = req.body || {};
+    if (!orderID) return res.status(400).json({ ok: false, error: "Missing orderID" });
+
+    const token = await getAccessToken();
+    const r = await fetchFn(`${BASE}/v2/checkout/orders/${orderID}/capture`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    });
+
+    let j = null;
+    try { j = await r.json(); } catch {}
+    if (!r.ok) {
+      const msg = j?.message || (await r.text().catch(() => "")) || "Capture failed";
+      console.error("[PayPal] capture failed:", r.status, msg);
+      return res.status(500).json({ ok: false, error: msg });
+    }
+
+    // Short reference for your /success page
+    const ref =
+      j?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
+      j?.id ||
+      orderID;
+
+    res.json({ ok: true, token: ref, details: j });
+  } catch (e) {
+    console.error("capture-order error:", e);
+    res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+export default router;

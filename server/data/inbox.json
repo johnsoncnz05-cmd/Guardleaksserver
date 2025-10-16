@@ -1,0 +1,76 @@
+{
+  "threads": {
+    "robertsegg63@gmail.com::,,": {
+      "id": "robertsegg63@gmail.com::,,",
+      "fromName": "michael dufrene",
+      "fromEmail": "robertsegg63@gmail.com",
+      "subject": ",,",
+      "status": "open",
+      "lastMessageAt": "2025-10-16T10:07:23.473Z",
+      "messages": [
+        {
+          "id": "xd4vhqso8pw3cpxiz54p",
+          "direction": "in",
+          "createdAt": "2025-10-16T09:53:05.373Z",
+          "fromName": "michael dufrene",
+          "fromEmail": "robertsegg63@gmail.com",
+          "body": "HI"
+        },
+        {
+          "id": "swfj5baf966azi9fp68vy",
+          "direction": "out",
+          "createdAt": "2025-10-16T10:03:11.854Z",
+          "fromName": "Admin",
+          "fromEmail": "admin@local",
+          "body": "thanks"
+        },
+        {
+          "id": "gq1yyiyp6e3telwfgilw4",
+          "direction": "in",
+          "createdAt": "2025-10-16T10:04:42.804Z",
+          "fromName": "michael dufrenegfg",
+          "fromEmail": "robertsegg63@gmail.com",
+          "body": "screenshot"
+        },
+        {
+          "id": "3bf89ci5nnm0d43do5hw77",
+          "direction": "in",
+          "createdAt": "2025-10-16T10:06:50.429Z",
+          "fromName": "michael dufrene",
+          "fromEmail": "robertsegg63@gmail.com",
+          "body": "help"
+        },
+        {
+          "id": "tfvztmgzy8f5ibh2uz4xny",
+          "direction": "out",
+          "createdAt": "2025-10-16T10:07:23.473Z",
+          "fromName": "Admin",
+          "fromEmail": "admin@local",
+          "body": "ok"
+        }
+      ]
+    },
+    "robertsegsg63@gmail.com::,,sd": {
+      "id": "robertsegsg63@gmail.com::,,sd",
+      "fromName": "michael dufrene",
+      "fromEmail": "robertsegsg63@gmail.com",
+      "subject": ",,sd",
+      "status": "open",
+      "lastMessageAt": "2025-10-16T10:57:05.013Z",
+      "messages": [
+        {
+          "id": "lx1w9l8a0nd8btn1i8tht",
+          "direction": "in",
+          "createdAt": "2025-10-16T10:57:05.013Z",
+          "fromName": "michael dufrene",
+          "fromEmail": "robertsegsg63@gmail.com",
+          "body": "yo"
+        }
+      ]
+    }
+  },
+  "order": [
+    "robertsegsg63@gmail.com::,,sd",
+    "robertsegg63@gmail.com::,,"
+  ]
+}
