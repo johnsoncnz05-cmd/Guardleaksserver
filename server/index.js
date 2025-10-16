@@ -4,7 +4,7 @@ import { fileURLToPath } from "url";
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import { requireAuth } from "./middleware/auth.js"; // stays as-is
+import { requireAuth } from "./middle ware/auth.js"; // ← your path; left unchanged
 
 // -------- dirname helpers --------
 const __filename = fileURLToPath(import.meta.url);
@@ -30,18 +30,35 @@ app.set("trust proxy", 1);
 app.use(express.json({ limit: "200mb" }));
 app.use(express.urlencoded({ extended: true, limit: "200mb" }));
 
-// CORS (runs AFTER app is created)
+// --------- CORS (after app creation) ---------
+// Allow your production domains AND your dev Vite port (8081).
+// You can extend via CORS_ORIGINS (comma-separated) if needed.
+const defaultOrigins = [
+  "https://guardleaks.com",
+  "https://www.guardleaks.com",
+  "http://localhost:5173", // Vite default
+  "http://localhost:8081", // your current dev port
+  "http://127.0.0.1:8081",
+];
+
+const extra = clean(process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const ALLOWED_ORIGINS = Array.from(new Set([...defaultOrigins, ...extra]));
+
 app.use(
   cors({
-    origin: [
-      "https://guardleaks.com",
-      "https://www.guardleaks.com",
-      "http://localhost:5173",
-      "http://localhost:8081",
-    ],
+    origin: (origin, cb) => {
+      // allow REST tools / same-origin requests with no Origin header
+      if (!origin) return cb(null, true);
+      return cb(null, ALLOWED_ORIGINS.includes(origin));
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 204,
   })
 );
 
@@ -60,14 +77,15 @@ if (String(process.env.FORCE_HTTPS || "").toLowerCase() === "true") {
   const { default: authRoutes } = await import("./auth.routes.js");
   const { default: adminRoutes } = await import("./admin.routes.js");
   const { default: checkRoutes } = await import("./check.routes.js");
-  const { default: inboxRoutes } = await import("./inbox.routes.js"); // ← add this
+  const { default: inboxRoutes } = await import("./inbox.routes.js"); // contact/inbox
 
   app.use("/api/auth", authRoutes);
   app.get("/api/me", requireAuth, (req, res) => res.json({ user: req.user }));
   app.use("/api/admin", adminRoutes);
   app.use("/api", checkRoutes);
 
-  app.use("/api", inboxRoutes); // ← mount after auth/check (public/contact + admin/inbox)
+  // Mount contact/inbox after auth/check
+  app.use("/api", inboxRoutes);
 }
 
 // -------- fetch polyfill for Node < 18 --------
@@ -180,7 +198,7 @@ app.post("/api/payments/capture-order", async (req, res) => {
 
 // -------- Google Sheet CSV -> JSON rows (no auth; published link) --------
 function parseCsvLoosely(text) {
-  // simple CSV splitter; good enough for Sheets "Publish to web" CSV
+  // simple CSV splitter; good for Sheets "Publish to web" CSV
   const rows = [];
   let cur = "", row = [], inQuotes = false;
 
@@ -196,7 +214,7 @@ function parseCsvLoosely(text) {
       if (cur.length || row.length) row.push(cur);
       if (row.length) rows.push(row);
       cur = ""; row = [];
-      if (ch === "\r" && next === "\n") i++; // CRLF
+      if (ch === "\r" && next === "\n") i++;
       continue;
     }
     cur += ch;
@@ -247,4 +265,5 @@ app.use("/api", (_req, res) => res.status(404).json({ ok: false, error: "Not fou
 const PORT = Number(process.env.PORT || 5062);
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT} (PayPal=${PAYPAL_MODE})`);
+  console.log(`[CORS] ${ALLOWED_ORIGINS.join(", ")}`);
 });
