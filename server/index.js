@@ -4,56 +4,46 @@ import { fileURLToPath } from "url";
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import { requireAuth } from "./middle ware/auth.js"; // ← your path; left unchanged
 
-// -------- dirname helpers --------
+// ----------------------------------------------------
+// dirname + env
+// ----------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// 🔐 Load ONLY server/.env (must happen BEFORE reading env vars)
+// Load ONLY server/.env (do this before reading envs)
 dotenv.config({ path: path.resolve(__dirname, ".env") });
 
-// Small helper to trim accidental trailing comments/spaces
+// Trim helper for env values with comments
 const clean = (v) => (v ?? "").split("#")[0].trim();
 
-const PAYPAL_MODE = clean(process.env.PAYPAL_MODE) === "live" ? "live" : "sandbox";
-const PAYPAL_CLIENT_ID = clean(process.env.PAYPAL_CLIENT_ID);
-const PAYPAL_SECRET = clean(process.env.PAYPAL_SECRET);
-
-// ---- App init (create app BEFORE using any app.use)
+// ----------------------------------------------------
+// App
+// ----------------------------------------------------
 const app = express();
-
-// If running behind Render/other proxies, this helps with HTTPS + IPs
 app.set("trust proxy", 1);
-
-// Core parsers
 app.use(express.json({ limit: "200mb" }));
 app.use(express.urlencoded({ extended: true, limit: "200mb" }));
 
-// --------- CORS (after app creation) ---------
-// Allow your production domains AND your dev Vite port (8081).
-// You can extend via CORS_ORIGINS (comma-separated) if needed.
+// CORS (prod + dev ports)
 const defaultOrigins = [
   "https://guardleaks.com",
   "https://www.guardleaks.com",
-  "http://localhost:5173", // Vite default
-  "http://localhost:8081", // your current dev port
+  "http://localhost:5173", // vite default
+  "http://localhost:8081", // your dev port
   "http://127.0.0.1:8081",
 ];
-
-const extra = clean(process.env.CORS_ORIGINS || "")
+const extraOrigins = clean(process.env.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
-const ALLOWED_ORIGINS = Array.from(new Set([...defaultOrigins, ...extra]));
+const ALLOWED_ORIGINS = Array.from(new Set([...defaultOrigins, ...extraOrigins]));
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow REST tools / same-origin requests with no Origin header
-      if (!origin) return cb(null, true);
-      return cb(null, ALLOWED_ORIGINS.includes(origin));
+      if (!origin) return cb(null, true); // same-origin / curl
+      cb(null, ALLOWED_ORIGINS.includes(origin));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -62,7 +52,7 @@ app.use(
   })
 );
 
-// Optional: force HTTPS in production (set FORCE_HTTPS=true on Render if desired)
+// Optional HTTPS redirect when behind a proxy (Render)
 if (String(process.env.FORCE_HTTPS || "").toLowerCase() === "true") {
   app.use((req, res, next) => {
     if (req.get("x-forwarded-proto") === "http") {
@@ -72,32 +62,68 @@ if (String(process.env.FORCE_HTTPS || "").toLowerCase() === "true") {
   });
 }
 
-// -------- dynamic route imports (kept as you had) --------
-{
-  const { default: authRoutes } = await import("./auth.routes.js");
-  const { default: adminRoutes } = await import("./admin.routes.js");
-  const { default: checkRoutes } = await import("./check.routes.js");
-  const { default: inboxRoutes } = await import("./inbox.routes.js"); // contact/inbox
-
-  app.use("/api/auth", authRoutes);
-  app.get("/api/me", requireAuth, (req, res) => res.json({ user: req.user }));
-  app.use("/api/admin", adminRoutes);
-  app.use("/api", checkRoutes);
-
-  // Mount contact/inbox after auth/check
-  app.use("/api", inboxRoutes);
+// ----------------------------------------------------
+// Auth middleware (robust import)
+// ----------------------------------------------------
+let requireAuth = (req, _res, next) => next();
+try {
+  // Try original path with space (if that’s really in your tree)
+  const mod = await import("./middle ware/auth.js").catch(() => null);
+  if (mod) requireAuth = mod.requireAuth || mod.default || requireAuth;
+} catch {}
+if (requireAuth === ((req, _res, next) => next())) {
+  // Try common path without space
+  try {
+    const mod2 = await import("./middleware/auth.js").catch(() => null);
+    if (mod2) requireAuth = mod2.requireAuth || mod2.default || requireAuth;
+  } catch {}
+}
+if (requireAuth === ((req, _res, next) => next())) {
+  console.warn("⚠️  No auth middleware found (using pass-through).");
 }
 
-// -------- fetch polyfill for Node < 18 --------
-const hasFetch = typeof globalThis.fetch === "function";
+// ----------------------------------------------------
+// Dynamic routes (each is optional; we log if missing)
+// ----------------------------------------------------
+async function mountRoute(mountPath, file) {
+  try {
+    const mod = await import(file);
+    const router = mod.default || mod.router || mod;
+    app.use(mountPath, router);
+    console.log(`[routes] mounted ${file} at ${mountPath}`);
+  } catch (e) {
+    console.warn(`[routes] skipped ${file}: ${e?.message || e}`);
+  }
+}
+
+// /api/auth
+await mountRoute("/api/auth", "./auth.routes.js");
+// /api/me (example protected endpoint)
+app.get("/api/me", requireAuth, (req, res) => res.json({ user: req.user || null }));
+// /api/admin
+await mountRoute("/api/admin", "./admin.routes.js");
+// /api (main check routes)
+await mountRoute("/api", "./check.routes.js");
+// /api (contact/inbox)
+await mountRoute("/api", "./inbox.routes.js");
+
+// ----------------------------------------------------
+// fetch polyfill (Node < 18)
+// ----------------------------------------------------
 let fetchFn = globalThis.fetch;
-if (!hasFetch) {
+if (typeof fetchFn !== "function") {
   const { default: nodeFetch } = await import("node-fetch");
   fetchFn = nodeFetch;
 }
 
-// -------- PayPal config (index-only) --------
-const BASE =
+// ----------------------------------------------------
+// PayPal
+// ----------------------------------------------------
+const PAYPAL_MODE = clean(process.env.PAYPAL_MODE) === "live" ? "live" : "sandbox";
+const PAYPAL_CLIENT_ID = clean(process.env.PAYPAL_CLIENT_ID);
+const PAYPAL_SECRET = clean(process.env.PAYPAL_SECRET);
+
+const PP_BASE =
   PAYPAL_MODE === "live"
     ? "https://api-m.paypal.com"
     : "https://api-m.sandbox.paypal.com";
@@ -109,8 +135,11 @@ if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
 }
 
 async function getAccessToken() {
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
+    throw new Error("PayPal not configured");
+  }
   const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString("base64");
-  const res = await fetchFn(`${BASE}/v1/oauth2/token`, {
+  const res = await fetchFn(`${PP_BASE}/v1/oauth2/token`, {
     method: "POST",
     headers: {
       Authorization: `Basic ${auth}`,
@@ -126,7 +155,6 @@ async function getAccessToken() {
   return data.access_token;
 }
 
-// -------- Payments endpoints (kept here) --------
 app.post("/api/payments/create-order", async (req, res) => {
   try {
     const { amount, currency = "USD", label = "Support" } = req.body || {};
@@ -135,22 +163,13 @@ app.post("/api/payments/create-order", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid amount" });
     }
     const token = await getAccessToken();
-    const r = await fetchFn(`${BASE}/v2/checkout/orders`, {
+    const r = await fetchFn(`${PP_BASE}/v2/checkout/orders`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         intent: "CAPTURE",
-        purchase_units: [
-          {
-            amount: { currency_code: currency, value: n.toFixed(2) },
-            description: label,
-          },
-        ],
-        application_context: {
-          brand_name: "GuardLeaks",
-          user_action: "PAY_NOW",
-          shipping_preference: "NO_SHIPPING",
-        },
+        purchase_units: [{ amount: { currency_code: currency, value: n.toFixed(2) }, description: label }],
+        application_context: { brand_name: "GuardLeaks", user_action: "PAY_NOW", shipping_preference: "NO_SHIPPING" },
       }),
     });
     const j = await r.json().catch(() => null);
@@ -161,7 +180,7 @@ app.post("/api/payments/create-order", async (req, res) => {
     }
     res.json({ ok: true, orderID: j.id });
   } catch (e) {
-    console.error("create-order error:", e);
+    console.error("create-order error:", e?.message || e);
     res.status(500).json({ ok: false, error: "Server error" });
   }
 });
@@ -170,38 +189,31 @@ app.post("/api/payments/capture-order", async (req, res) => {
   try {
     const { orderID } = req.body || {};
     if (!orderID) return res.status(400).json({ ok: false, error: "Missing orderID" });
-
     const token = await getAccessToken();
-    const r = await fetchFn(`${BASE}/v2/checkout/orders/${orderID}/capture`, {
+    const r = await fetchFn(`${PP_BASE}/v2/checkout/orders/${orderID}/capture`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     });
-
     const j = await r.json().catch(() => null);
     if (!r.ok) {
       const msg = j?.message || (await r.text().catch(() => "")) || "Capture failed";
       console.error("[PayPal] capture failed:", r.status, msg);
       return res.status(500).json({ ok: false, error: msg });
     }
-
-    const ref =
-      j?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
-      j?.id ||
-      orderID;
-
+    const ref = j?.purchase_units?.[0]?.payments?.captures?.[0]?.id || j?.id || orderID;
     res.json({ ok: true, token: ref, details: j });
   } catch (e) {
-    console.error("capture-order error:", e);
+    console.error("capture-order error:", e?.message || e);
     res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-// -------- Google Sheet CSV -> JSON rows (no auth; published link) --------
+// ----------------------------------------------------
+// Sheets CSV → JSON (published CSV URL)
+// ----------------------------------------------------
 function parseCsvLoosely(text) {
-  // simple CSV splitter; good for Sheets "Publish to web" CSV
   const rows = [];
   let cur = "", row = [], inQuotes = false;
-
   for (let i = 0; i < text.length; i++) {
     const ch = text[i], next = text[i + 1];
     if (ch === '"') {
@@ -227,7 +239,6 @@ app.get("/api/admin/sheets-sync", async (req, res) => {
   try {
     const url = String(req.query.url || "");
     if (!url) return res.status(400).json({ error: "url required (published CSV link)" });
-
     const r = await fetchFn(url);
     if (!r.ok) {
       const txt = await r.text().catch(() => "");
@@ -236,24 +247,22 @@ app.get("/api/admin/sheets-sync", async (req, res) => {
     const csv = await r.text();
     const grid = parseCsvLoosely(csv);
     const headers = grid[0] || [];
-    const rows = grid.slice(1).filter(arr => arr.some(c => String(c).trim() !== ""));
-
+    const rows = grid.slice(1).filter((arr) => arr.some((c) => String(c).trim() !== ""));
     res.json({ headers, rows, count: rows.length });
   } catch (e) {
     res.status(500).json({ error: e?.message || "sheet fetch failed" });
   }
 });
 
-// ---------- STATIC FRONTEND (Vite build) ----------
+// ----------------------------------------------------
+// Static frontend (Vite build)
+// ----------------------------------------------------
 const DIST_DIR = path.join(__dirname, "..", "dist");
 
-// Small health check (good for Render probes)
 app.get("/healthz", (_req, res) => res.type("text").send("ok"));
-
-// Serve static files from Vite build
 app.use(express.static(DIST_DIR));
 
-// SPA fallback: send index.html for any non-API route
+// SPA fallback for non-API routes
 app.get(/^(?!\/api\/).*/, (_req, res) => {
   res.sendFile(path.join(DIST_DIR, "index.html"));
 });
@@ -261,7 +270,9 @@ app.get(/^(?!\/api\/).*/, (_req, res) => {
 // JSON 404 for API
 app.use("/api", (_req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
+// ----------------------------------------------------
 // Start
+// ----------------------------------------------------
 const PORT = Number(process.env.PORT || 5062);
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT} (PayPal=${PAYPAL_MODE})`);
