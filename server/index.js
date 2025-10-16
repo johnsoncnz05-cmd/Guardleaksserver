@@ -4,10 +4,11 @@ import { fileURLToPath } from "url";
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import { requireAuth } from "./middleware/auth.js"; // okay to keep static; it doesn't run until used
+import { requireAuth } from "./middleware/auth.js"; // stays as-is
 
 // -------- dirname helpers --------
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // 🔐 Load ONLY server/.env (must happen BEFORE reading env vars)
 dotenv.config({ path: path.resolve(__dirname, ".env") });
@@ -21,6 +22,9 @@ const PAYPAL_SECRET = clean(process.env.PAYPAL_SECRET);
 
 // ---- App init (create app BEFORE using any app.use)
 const app = express();
+
+// If running behind Render/other proxies, this helps with HTTPS + IPs
+app.set("trust proxy", 1);
 
 // Core parsers
 app.use(express.json({ limit: "200mb" }));
@@ -39,6 +43,16 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+// Optional: force HTTPS in production (set FORCE_HTTPS=true on Render if desired)
+if (String(process.env.FORCE_HTTPS || "").toLowerCase() === "true") {
+  app.use((req, res, next) => {
+    if (req.get("x-forwarded-proto") === "http") {
+      return res.redirect(301, `https://${req.get("host")}${req.originalUrl}`);
+    }
+    next();
+  });
+}
 
 // -------- dynamic route imports (kept as you had) --------
 {
@@ -209,6 +223,20 @@ app.get("/api/admin/sheets-sync", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e?.message || "sheet fetch failed" });
   }
+});
+
+// ---------- STATIC FRONTEND (Vite build) ----------
+const DIST_DIR = path.join(__dirname, "..", "dist");
+
+// Small health check (good for Render probes)
+app.get("/healthz", (_req, res) => res.type("text").send("ok"));
+
+// Serve static files from Vite build
+app.use(express.static(DIST_DIR));
+
+// SPA fallback: send index.html for any non-API route
+app.get(/^(?!\/api\/).*/, (_req, res) => {
+  res.sendFile(path.join(DIST_DIR, "index.html"));
 });
 
 // JSON 404 for API
