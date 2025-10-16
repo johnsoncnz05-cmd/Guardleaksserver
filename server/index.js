@@ -3,13 +3,15 @@ import path from "path";
 import { fileURLToPath } from "url";
 import express from "express";
 import dotenv from "dotenv";
-import cors from "cors";
-import { requireAuth } from "./middleware/auth.js"; // okay to keep static; it doesn't run until used
+import { requireAuth } from "./middleware/auth.js";
+// after dynamic imports block
+
 
 // -------- dirname helpers --------
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// 🔐 Load ONLY server/.env (must happen BEFORE reading env vars)
+// 🔐 Load ONLY server/.env (must happen BEFORE importing route modules)
 dotenv.config({ path: path.resolve(__dirname, ".env") });
 
 // Small helper to trim accidental trailing comments/spaces
@@ -19,42 +21,22 @@ const PAYPAL_MODE = clean(process.env.PAYPAL_MODE) === "live" ? "live" : "sandbo
 const PAYPAL_CLIENT_ID = clean(process.env.PAYPAL_CLIENT_ID);
 const PAYPAL_SECRET = clean(process.env.PAYPAL_SECRET);
 
-// ---- App init (create app BEFORE using any app.use)
 const app = express();
-
-// Core parsers
 app.use(express.json({ limit: "200mb" }));
 app.use(express.urlencoded({ extended: true, limit: "200mb" }));
-
-// CORS (runs AFTER app is created)
-app.use(
-  cors({
-    origin: [
-      "https://guardleaks.com",
-      "https://www.guardleaks.com",
-      "http://localhost:5173",
-    ],
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-
-// -------- dynamic route imports (kept as you had) --------
 {
-  const { default: authRoutes } = await import("./auth.routes.js");
-  const { default: adminRoutes } = await import("./admin.routes.js");
-  const { default: checkRoutes } = await import("./check.routes.js");
-  const { default: inboxRoutes } = await import("./inbox.routes.js"); // ← add this
+  const { default: authRoutes }   = await import("./auth.routes.js");
+  const { default: adminRoutes }  = await import("./admin.routes.js");
+  const { default: checkRoutes }  = await import("./check.routes.js");
+  const { default: inboxRoutes }  = await import("./inbox.routes.js");   // ← add this
 
   app.use("/api/auth", authRoutes);
   app.get("/api/me", requireAuth, (req, res) => res.json({ user: req.user }));
   app.use("/api/admin", adminRoutes);
   app.use("/api", checkRoutes);
 
-  app.use("/api", inboxRoutes); // ← mount after auth/check (public/contact + admin/inbox)
+  app.use("/api", inboxRoutes);  // ← mount after auth/check (public/contact + admin/inbox)
 }
-
 // -------- fetch polyfill for Node < 18 --------
 const hasFetch = typeof globalThis.fetch === "function";
 let fetchFn = globalThis.fetch;
@@ -64,10 +46,9 @@ if (!hasFetch) {
 }
 
 // -------- PayPal config (index-only) --------
-const BASE =
-  PAYPAL_MODE === "live"
-    ? "https://api-m.paypal.com"
-    : "https://api-m.sandbox.paypal.com";
+const BASE = PAYPAL_MODE === "live"
+  ? "https://api-m.paypal.com"
+  : "https://api-m.sandbox.paypal.com";
 
 if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
   console.warn("⚠️  Missing PAYPAL_CLIENT_ID or PAYPAL_SECRET in server/.env");
@@ -153,8 +134,7 @@ app.post("/api/payments/capture-order", async (req, res) => {
 
     const ref =
       j?.purchase_units?.[0]?.payments?.captures?.[0]?.id ||
-      j?.id ||
-      orderID;
+      j?.id || orderID;
 
     res.json({ ok: true, token: ref, details: j });
   } catch (e) {
@@ -162,7 +142,6 @@ app.post("/api/payments/capture-order", async (req, res) => {
     res.status(500).json({ ok: false, error: "Server error" });
   }
 });
-
 // -------- Google Sheet CSV -> JSON rows (no auth; published link) --------
 function parseCsvLoosely(text) {
   // simple CSV splitter; good enough for Sheets "Publish to web" CSV
@@ -211,6 +190,7 @@ app.get("/api/admin/sheets-sync", async (req, res) => {
   }
 });
 
+
 // JSON 404 for API
 app.use("/api", (_req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
@@ -219,3 +199,4 @@ const PORT = Number(process.env.PORT || 5062);
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT} (PayPal=${PAYPAL_MODE})`);
 });
+
