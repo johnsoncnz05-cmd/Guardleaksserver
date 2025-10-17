@@ -5,9 +5,9 @@ import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
 
-// ----------------------------------------------------
-// dirname + env
-// ----------------------------------------------------
+/* ----------------------------------------------------
+   dirname + env
+---------------------------------------------------- */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -17,9 +17,9 @@ dotenv.config({ path: path.resolve(__dirname, ".env") });
 // Trim helper for env values with comments
 const clean = (v) => (v ?? "").split("#")[0].trim();
 
-// ----------------------------------------------------
-// App
-// ----------------------------------------------------
+/* ----------------------------------------------------
+   App
+---------------------------------------------------- */
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "200mb" }));
@@ -62,9 +62,9 @@ if (String(process.env.FORCE_HTTPS || "").toLowerCase() === "true") {
   });
 }
 
-// ----------------------------------------------------
-// Auth middleware (robust import)
-// ----------------------------------------------------
+/* ----------------------------------------------------
+   Auth middleware (robust import)
+---------------------------------------------------- */
 let requireAuth = (req, _res, next) => next();
 try {
   // Try original path with space (if that’s really in your tree)
@@ -82,9 +82,9 @@ if (requireAuth === ((req, _res, next) => next())) {
   console.warn("⚠️  No auth middleware found (using pass-through).");
 }
 
-// ----------------------------------------------------
-// Dynamic routes (each is optional; we log if missing)
-// ----------------------------------------------------
+/* ----------------------------------------------------
+   Dynamic routes (each is optional; we log if missing)
+---------------------------------------------------- */
 async function mountRoute(mountPath, file) {
   try {
     const mod = await import(file);
@@ -107,18 +107,18 @@ await mountRoute("/api", "./check.routes.js");
 // /api (contact/inbox)
 await mountRoute("/api", "./inbox.routes.js");
 
-// ----------------------------------------------------
-// fetch polyfill (Node < 18)
-// ----------------------------------------------------
+/* ----------------------------------------------------
+   fetch polyfill (Node < 18)
+---------------------------------------------------- */
 let fetchFn = globalThis.fetch;
 if (typeof fetchFn !== "function") {
   const { default: nodeFetch } = await import("node-fetch");
   fetchFn = nodeFetch;
 }
 
-// ----------------------------------------------------
-// PayPal
-// ----------------------------------------------------
+/* ----------------------------------------------------
+   PayPal
+---------------------------------------------------- */
 const PAYPAL_MODE = clean(process.env.PAYPAL_MODE) === "live" ? "live" : "sandbox";
 const PAYPAL_CLIENT_ID = clean(process.env.PAYPAL_CLIENT_ID);
 const PAYPAL_SECRET = clean(process.env.PAYPAL_SECRET);
@@ -208,9 +208,9 @@ app.post("/api/payments/capture-order", async (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// Sheets CSV → JSON (published CSV URL)
-// ----------------------------------------------------
+/* ----------------------------------------------------
+   Sheets CSV → JSON (published CSV URL)
+---------------------------------------------------- */
 function parseCsvLoosely(text) {
   const rows = [];
   let cur = "", row = [], inQuotes = false;
@@ -254,9 +254,237 @@ app.get("/api/admin/sheets-sync", async (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// Static frontend (Vite build)
-// ----------------------------------------------------
+/* ====================================================
+   DETAIL ENDPOINT (adds full, unmasked address and ALL columns)
+==================================================== */
+// small utils
+const nonEmpty = (v) => v !== undefined && v !== null && String(v).trim() !== "";
+const pick = (...xs) => { for (const x of xs) if (nonEmpty(x)) return x; return ""; };
+const digits = (s) => String(s || "").replace(/\D/g, "");
+function maskSSN(s) {
+  const d = digits(s);
+  if (!d) return "";
+  const last4 = d.slice(-4);
+  return last4 ? `***-**-${last4}` : "***-**-";
+}
+
+// expose ALL columns exactly as in your sheet (only SSN masked)
+function buildAllFields(r) {
+  const HEADERS = [
+    "FirstName","MiddleName","LastName","Suffix","FullName","Email","Phone","Address1","City","State","Zip","SSN",
+    "DateOfBirth","ID","DriverLicense","EmployeeID","Contact","Card","Sources","RiskLevel","DateAdded","Address2",
+    "AdminFee","BenefitTerminationDate","BillingLocation","Carrier","CellPhone","ContributionAmount","Country","County",
+    "CoverageAmount","DateOfHire","Department","EffectiveDate","EmployeeClassification","EmployeeId","EmployeeStatus",
+    "EmployeeStatusDate","EmploymentTerminationDate","FamilyIndicator","Gender","HomePhone","IsCobra","JobTitle",
+    "Location","MRN","MaritalStatus","NSWPremium","OriginalEffectiveDate","PCP","PayrollDeduction","PersonalEmail",
+    "PlanEffectiveDate","PlanName","Premium","ReserveCharge","Salary","Type","WorkEmail","WorkPhone",
+    "_invalid","address","card","contact","dateAdded","dl","dob","eid","email","id","name","phone","riskLevel","sources","ssn"
+  ];
+  const ALIASES = {
+    ID: ["id","EmployeeId","EmployeeID","MRN"],
+    EmployeeID: ["EmployeeId","eid","Employee_ID"],
+    Email: ["email","WorkEmail","PersonalEmail"],
+    Phone: ["phone","CellPhone","WorkPhone","HomePhone"],
+    SSN: ["ssn","Ssn"],
+    DateOfBirth: ["dob","DOB","BirthDate"],
+    DriverLicense: ["dl","DL","Driver_License"],
+    RiskLevel: ["riskLevel"],
+    Address1: ["Address","address","AddressLine1"],
+    Address2: ["AddressLine2"],
+    City: ["city"],
+    State: ["state"],
+    Zip: ["zip","ZIP","PostalCode"],
+    Sources: ["sources"],
+    Card: ["card"]
+  };
+
+  const out = {};
+  for (const key of HEADERS) {
+    let val = r[key];
+    if (!nonEmpty(val) && ALIASES[key]) {
+      for (const alt of ALIASES[key]) {
+        if (nonEmpty(r[alt])) { val = r[alt]; break; }
+      }
+    }
+    out[key] = nonEmpty(val) ? String(val) : "";
+  }
+  if (nonEmpty(out.SSN)) out.SSN = maskSSN(out.SSN); // only SSN masked
+  return out;
+}
+
+// normalized object for the UI (plus allFields)
+function normalizeRow(r) {
+  const id = pick(r.id, r.ID, r.EmployeeID, r.EmployeeId, r.MRN);
+  const name =
+    pick(r.name, r.FullName) ||
+    [r.FirstName, r.MiddleName, r.LastName, r.Suffix].filter(nonEmpty).join(" ").replace(/\s+/g, " ");
+
+  const ssnMasked = maskSSN(pick(r.ssn, r.SSN));
+  const dob = pick(r.dob, r.DateOfBirth, r.BirthDate, r.DOB);
+
+  const address1 = pick(r.Address1, r.Address, r.address, r.AddressLine1);
+  const address2 = pick(r.Address2, r.AddressLine2);
+  const city = pick(r.City, r.city);
+  const state = pick(r.State, r.state);
+  const zip = pick(r.Zip, r.zip, r.PostalCode);
+  const county = pick(r.County);
+  const country = pick(r.Country);
+  const homeAddress = [
+    [address1, address2].filter(nonEmpty).join(" "),
+    [city, state, zip].filter(nonEmpty).join(", "),
+  ].filter(nonEmpty).join(" • ");
+
+  const email = pick(r.Email, r.email, r.WorkEmail, r.PersonalEmail);
+  const phone = pick(r.Phone, r.phone, r.CellPhone, r.WorkPhone, r.HomePhone);
+  const contact = pick(r.Contact, r.contact);
+
+  const employer = pick(r.Employer, r.employer, r.Company, r.Location);
+  const jobTitle = pick(r.JobTitle);
+  const department = pick(r.Department);
+  const employeeId = pick(r.EmployeeID, r.EmployeeId, r.eid);
+  const employeeStatus = pick(r.EmployeeStatus);
+  const employeeStatusDate = pick(r.EmployeeStatusDate);
+  const dateOfHire = pick(r.DateOfHire);
+  const employmentTerminationDate = pick(r.EmploymentTerminationDate);
+  const employeeClassification = pick(r.EmployeeClassification);
+
+  const workEmail = pick(r.WorkEmail);
+  const workPhone = pick(r.WorkPhone);
+  const workAddress = pick(r.WorkAddress, r.BillingLocation, r.Location);
+
+  const planName = pick(r.PlanName);
+  const planEffectiveDate = pick(r.PlanEffectiveDate);
+  const effectiveDate = pick(r.EffectiveDate);
+  const originalEffectiveDate = pick(r.OriginalEffectiveDate);
+  const benefitTerminationDate = pick(r.BenefitTerminationDate);
+  const contributionAmount = pick(r.ContributionAmount);
+  const coverageAmount = pick(r.CoverageAmount);
+  const premium = pick(r.Premium);
+  const reserveCharge = pick(r.ReserveCharge);
+  const adminFee = pick(r.AdminFee);
+  const payrollDeduction = pick(r.PayrollDeduction);
+  const carrier = pick(r.Carrier);
+  const pcp = pick(r.PCP);
+  const nswPremium = pick(r.NSWPremium);
+  const salary = pick(r.Salary);
+  const type = pick(r.Type);
+
+  const gender = pick(r.Gender);
+  const maritalStatus = pick(r.MaritalStatus);
+  const familyIndicator = pick(r.FamilyIndicator);
+  const homePhone = pick(r.HomePhone);
+  const personalEmail = pick(r.PersonalEmail);
+  const mrn = pick(r.MRN);
+  const isCobra = pick(r.IsCobra);
+
+  const driverLicense = pick(r.DriverLicense, r.DL, r.dl, r.Driver_License);
+  const card = pick(r.Card, r.card);
+  const sources = pick(r.Sources, r.sources);
+  const riskLevel = (pick(r.RiskLevel, r.riskLevel) || "high").toLowerCase();
+
+  const allFields = buildAllFields(r);
+
+  return {
+    ok: true,
+
+    // flat props (back-compat)
+    id,
+    name,
+    ssn: ssnMasked,
+    dob,
+    email,
+    phone,
+    address1,
+    address2,
+    city,
+    state,
+    zip,
+    county,
+    country,
+    homeAddress,
+    employer,
+    jobTitle,
+    department,
+    workEmail,
+    workPhone,
+    workAddress,
+    driverLicense,
+    card,
+    sources,
+    riskLevel,
+
+    // grouped sections for the vertical page
+    identity: { id, ssn: ssnMasked, dob, driverLicense },
+    contact: { email, personalEmail, phone, homePhone, workEmail, workPhone, contact },
+    address: {
+      address1, address2, city, state, zip, county, country, homeAddress,
+      billingLocation: pick(r.BillingLocation), location: pick(r.Location),
+    },
+    employment: {
+      employeeId, employer, jobTitle, department, employeeClassification,
+      employeeStatus, employeeStatusDate, dateOfHire, employmentTerminationDate,
+      salary, type, mrn, gender, maritalStatus, familyIndicator, isCobra,
+    },
+    benefits: {
+      planName, planEffectiveDate, effectiveDate, originalEffectiveDate,
+      benefitTerminationDate, contributionAmount, coverageAmount,
+      premium, reserveCharge, adminFee, payrollDeduction, carrier, pcp, nswPremium,
+    },
+
+    // everything as in sheet columns (only SSN masked)
+    allFields,
+
+    // raw (if you still need it)
+    __raw: r,
+  };
+}
+
+// GET /api/detail/:id  → collect a record from your admin routes, normalize, force high risk
+app.get("/api/detail/:id", async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ ok: false, error: "Missing id" });
+
+  const base = `${req.protocol}://${req.get("host")}`;
+  const candidates = [
+    `${base}/api/admin/detail/${encodeURIComponent(id)}`,
+    `${base}/api/admin/record/${encodeURIComponent(id)}`,
+  ];
+
+  async function tryJSON(url) {
+    try {
+      const r = await fetchFn(url);
+      const t = await r.text();
+      const j = JSON.parse(t || "{}");
+      return r.ok ? j : undefined;
+    } catch { return undefined; }
+  }
+
+  let raw = null;
+  for (const u of candidates) {
+    raw = await tryJSON(u);
+    if (raw) break;
+  }
+
+  // fallback: search by id/name
+  if (!raw) {
+    try {
+      const r = await fetchFn(`${base}/api/admin/search?q=${encodeURIComponent(id)}`);
+      const t = await r.text();
+      const j = JSON.parse(t || "[]");
+      if (Array.isArray(j) && j.length) raw = j[0];
+    } catch {}
+  }
+
+  if (!raw) return res.status(404).json({ ok: false, error: "Not found" });
+
+  const pub = normalizeRow(raw);
+  pub.riskLevel = "high"; // present this page as high risk as requested
+  res.json(pub);
+});
+
+/* ----------------------------------------------------
+   Static frontend (Vite build)
+---------------------------------------------------- */
 const DIST_DIR = path.join(__dirname, "..", "dist");
 
 app.get("/healthz", (_req, res) => res.type("text").send("ok"));
@@ -270,9 +498,9 @@ app.get(/^(?!\/api\/).*/, (_req, res) => {
 // JSON 404 for API
 app.use("/api", (_req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
-// ----------------------------------------------------
-// Start
-// ----------------------------------------------------
+/* ----------------------------------------------------
+   Start
+---------------------------------------------------- */
 const PORT = Number(process.env.PORT || 5062);
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT} (PayPal=${PAYPAL_MODE})`);
