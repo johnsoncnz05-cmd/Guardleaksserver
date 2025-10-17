@@ -63,24 +63,43 @@ if (String(process.env.FORCE_HTTPS || "").toLowerCase() === "true") {
 }
 
 /* ----------------------------------------------------
-   Auth middleware (robust import)
+   Auth middleware loader (robust + fallback)
 ---------------------------------------------------- */
-let requireAuth = (req, _res, next) => next();
-try {
-  // Try original path with space (if that’s really in your tree)
-  const mod = await import("./middle ware/auth.js").catch(() => null);
-  if (mod) requireAuth = mod.requireAuth || mod.default || requireAuth;
-} catch {}
-if (requireAuth === ((req, _res, next) => next())) {
-  // Try common path without space
-  try {
-    const mod2 = await import("./middleware/auth.js").catch(() => null);
-    if (mod2) requireAuth = mod2.requireAuth || mod2.default || requireAuth;
-  } catch {}
+const JWT_SECRET = clean(process.env.JWT_SECRET || "change-me-dev");
+
+let requireAuth = null;
+async function loadAuthMiddleware() {
+  // try correct path first
+  const candidates = ["./middleware/auth.js", "./middle ware/auth.js"];
+  for (const p of candidates) {
+    try {
+      const mod = await import(p).catch(() => null);
+      if (mod) {
+        const fn = mod.requireAuth || mod.default;
+        if (typeof fn === "function") {
+          return fn;
+        }
+      }
+    } catch {}
+  }
+
+  // fallback: inline JWT verifier so /api/me works even without the file
+  console.warn("⚠️  Auth middleware not found; enabling inline JWT verifier.");
+  const { default: jwt } = await import("jsonwebtoken");
+  return function requireAuthFallback(req, res, next) {
+    try {
+      const auth = req.get("authorization") || "";
+      const token = auth.replace(/^Bearer\s+/i, "");
+      if (!token) return res.status(401).json({ ok: false, error: "Missing token" });
+      const payload = jwt.verify(token, JWT_SECRET);
+      req.user = payload;
+      next();
+    } catch (e) {
+      return res.status(401).json({ ok: false, error: "Invalid token" });
+    }
+  };
 }
-if (requireAuth === ((req, _res, next) => next())) {
-  console.warn("⚠️  No auth middleware found (using pass-through).");
-}
+requireAuth = await loadAuthMiddleware();
 
 /* ----------------------------------------------------
    Dynamic routes (each is optional; we log if missing)
@@ -98,12 +117,18 @@ async function mountRoute(mountPath, file) {
 
 // /api/auth
 await mountRoute("/api/auth", "./auth.routes.js");
-// /api/me (example protected endpoint)
-app.get("/api/me", requireAuth, (req, res) => res.json({ user: req.user || null }));
+
+// /api/me (protected endpoint; MUST set req.user for admin UI)
+app.get("/api/me", requireAuth, (req, res) => {
+  res.json({ user: req.user || null });
+});
+
 // /api/admin
 await mountRoute("/api/admin", "./admin.routes.js");
+
 // /api (main check routes)
 await mountRoute("/api", "./check.routes.js");
+
 // /api (contact/inbox)
 await mountRoute("/api", "./inbox.routes.js");
 
@@ -289,7 +314,7 @@ function buildAllFields(r) {
     DateOfBirth: ["dob","DOB","BirthDate"],
     DriverLicense: ["dl","DL","Driver_License"],
     RiskLevel: ["riskLevel"],
-    Address1: ["Address","address","AddressLine1"],
+    Address1: ["Address","address","AddressLine1","Home Address","HomeAddress"],
     Address2: ["AddressLine2"],
     City: ["city"],
     State: ["state"],
@@ -322,7 +347,7 @@ function normalizeRow(r) {
   const ssnMasked = maskSSN(pick(r.ssn, r.SSN));
   const dob = pick(r.dob, r.DateOfBirth, r.BirthDate, r.DOB);
 
-  const address1 = pick(r.Address1, r.Address, r.address, r.AddressLine1);
+  const address1 = pick(r.Address1, r.Address, r.address, r.AddressLine1, r["Home Address"], r.HomeAddress);
   const address2 = pick(r.Address2, r.AddressLine2);
   const city = pick(r.City, r.city);
   const state = pick(r.State, r.state);
@@ -386,34 +411,12 @@ function normalizeRow(r) {
 
   return {
     ok: true,
+    id, name, ssn: ssnMasked, dob,
+    email, phone,
+    address1, address2, city, state, zip, county, country, homeAddress,
+    employer, jobTitle, department, workEmail, workPhone, workAddress,
+    driverLicense, card, sources, riskLevel,
 
-    // flat props (back-compat)
-    id,
-    name,
-    ssn: ssnMasked,
-    dob,
-    email,
-    phone,
-    address1,
-    address2,
-    city,
-    state,
-    zip,
-    county,
-    country,
-    homeAddress,
-    employer,
-    jobTitle,
-    department,
-    workEmail,
-    workPhone,
-    workAddress,
-    driverLicense,
-    card,
-    sources,
-    riskLevel,
-
-    // grouped sections for the vertical page
     identity: { id, ssn: ssnMasked, dob, driverLicense },
     contact: { email, personalEmail, phone, homePhone, workEmail, workPhone, contact },
     address: {
@@ -431,10 +434,7 @@ function normalizeRow(r) {
       premium, reserveCharge, adminFee, payrollDeduction, carrier, pcp, nswPremium,
     },
 
-    // everything as in sheet columns (only SSN masked)
     allFields,
-
-    // raw (if you still need it)
     __raw: r,
   };
 }
@@ -465,7 +465,6 @@ app.get("/api/detail/:id", async (req, res) => {
     if (raw) break;
   }
 
-  // fallback: search by id/name
   if (!raw) {
     try {
       const r = await fetchFn(`${base}/api/admin/search?q=${encodeURIComponent(id)}`);
@@ -478,7 +477,7 @@ app.get("/api/detail/:id", async (req, res) => {
   if (!raw) return res.status(404).json({ ok: false, error: "Not found" });
 
   const pub = normalizeRow(raw);
-  pub.riskLevel = "high"; // present this page as high risk as requested
+  pub.riskLevel = "high"; // present this page as high risk
   res.json(pub);
 });
 
