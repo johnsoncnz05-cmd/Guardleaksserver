@@ -478,7 +478,11 @@ router.get("/search", async (req, res) => {
   const s = (v) => (v == null ? "" : String(v)).trim();
   const sl = (v) => s(v).toLowerCase();
   const digits = (v) => s(v).replace(/\D/g, "");
-
+  
+  // NEW: explicit type override from client (optional)
+  const typeParam = String(req.query.type || "").toLowerCase();
+  const forcedType = ["name", "email", "phone", "address"].includes(typeParam) ? typeParam : null;
+  
   // detect intent
   const looksLikeEmail = /.+@.+\..+/.test(rawQ);
   const qDigits = digits(rawQ);
@@ -523,12 +527,12 @@ router.get("/search", async (req, res) => {
     return fields.some((a) => a.includes(q));
   };
 
-  // choose predicate
-  let predicate;
-  if (looksLikeEmail) predicate = inEmail;
-  else if (looksLikePhone) predicate = inPhone;
-  else if (looksLikeAddress) predicate = inAddress;
-  else predicate = inName;
+  const predicates = { name: inName, email: inEmail, phone: inPhone, address: inAddress };
+  let predicate = forcedType ? predicates[forcedType] :
+                  looksLikeEmail ? inEmail :
+                  looksLikePhone ? inPhone :
+                  looksLikeAddress ? inAddress :
+                  inName;
 
   const out = rows.filter((r) => predicate(r));
   res.json(out.slice(0, 2000));
