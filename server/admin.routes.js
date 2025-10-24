@@ -93,7 +93,7 @@ function composeAddress(obj) {
   return parts.join(", ");
 }
 
-/** Original row-to-record used for imports (unchanged) */
+/** Map a CSV row (normalized header map) into your record shape (for Sheet + imports) */
 function rowToRecord(header, values) {
   const o = {};
   header.forEach((h, i) => (o[norm(h)] = values[i]));
@@ -111,7 +111,7 @@ function rowToRecord(header, values) {
   const ssn = pick(o, ["ssn", "socialsecuritynumber"]);
   const dob = pick(o, ["dateofbirth", "dob", "birthdate", "birth"]);
   const address = composeAddress(o) || pick(o, ["address1", "address", "addressline1"]);
-  const id = pick(o, ["id", "employeeid", "mrn"]) || Math.random().toString(36).slice(2, 10);
+  const id = pick(o, ["id", "employeeid", "mrn"]) || ""; // may be missing in Sheet
 
   // simple risk
   let risk = "low";
@@ -138,7 +138,6 @@ router.get("/reviews", (_req, res) => {
 });
 
 /* ======================= Sheets: helpers & endpoints ======================= */
-/** Allow-list Google hosts to avoid SSRF abuse */
 function isAllowedSheetsHost(hostname) {
   return (
     /\.google\.com$/i.test(hostname) ||
@@ -148,7 +147,7 @@ function isAllowedSheetsHost(hostname) {
   );
 }
 
-/** Tiny CSV parser (handles quotes, commas, CRLF) so we can parse text */
+/** Tiny CSV parser for safety (quotes, commas, CRLF) */
 function parseSimpleCSV(text) {
   const rows = [];
   let row = [];
@@ -178,21 +177,19 @@ function parseSimpleCSV(text) {
   return rows;
 }
 
-/** Convert various Sheets links to a direct CSV export URL (server-side safety net). */
+/** Convert various Sheets links to a direct CSV export URL */
 function toCsvUrl(raw) {
   try {
     const u = new URL(String(raw || "").trim());
 
-    // already explicit CSV?
     if (u.searchParams.get("output") === "csv") return u.toString();
 
-    // Standard edit/view: /spreadsheets/d/<ID>/edit#gid=GID
     if (u.hostname === "docs.google.com" && /\/spreadsheets\/d\//.test(u.pathname)) {
       const parts = u.pathname.split("/");
       const idx = parts.indexOf("d");
       const afterD = parts[idx + 1];
 
-      // If it's /d/<ID>/edit...
+      // /spreadsheets/d/<ID>/edit#gid=GID
       if (afterD && afterD !== "e") {
         const id = afterD;
         const gidMatch = (u.hash || "").match(/gid=(\d+)/);
@@ -200,7 +197,7 @@ function toCsvUrl(raw) {
         return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&id=${id}&gid=${gid}`;
       }
 
-      // Publish-style: /spreadsheets/d/e/<PUBID>/pub[?gid=...]
+      // /spreadsheets/d/e/<PUBID>/pub[?gid=...]
       if (afterD === "e") {
         const gid = u.searchParams.get("gid");
         u.searchParams.set("output", "csv");
@@ -209,7 +206,6 @@ function toCsvUrl(raw) {
       }
     }
 
-    // gviz API links → convert to export endpoint
     if (u.hostname === "docs.google.com" && /\/spreadsheets\/d\//.test(u.pathname) && u.pathname.includes("/gviz/tq")) {
       const parts = u.pathname.split("/");
       const idx = parts.indexOf("d");
@@ -218,7 +214,6 @@ function toCsvUrl(raw) {
       if (id) return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&id=${id}&gid=${gid}`;
     }
 
-    // otherwise return as-is (still checked against allowlist in routes)
     return u.toString();
   } catch {
     return String(raw || "");
@@ -264,7 +259,7 @@ router.delete("/sheets-source", async (_req, res) => {
   }
 });
 
-/* ---- Aliases for UI: /settings/sheet-url (GET/POST/DELETE) ---- */
+/* Aliases for UI */
 router.get("/settings/sheet-url", async (_req, res) => {
   try {
     const url = await getSetting("sheet_csv_url", "");
@@ -273,7 +268,6 @@ router.get("/settings/sheet-url", async (_req, res) => {
     res.status(500).json({ ok: false, error: "Failed to read settings" });
   }
 });
-
 router.post("/settings/sheet-url", async (req, res) => {
   try {
     const raw = String(req.body?.url || "").trim();
@@ -293,7 +287,6 @@ router.post("/settings/sheet-url", async (req, res) => {
     res.status(500).json({ ok: false, error: "Failed to save" });
   }
 });
-
 router.delete("/settings/sheet-url", async (_req, res) => {
   try {
     await setSetting("sheet_csv_url", "");
@@ -303,130 +296,21 @@ router.delete("/settings/sheet-url", async (_req, res) => {
   }
 });
 
-router.get("/sheets-sync", async (req, res) => {
-  try {
-    let raw = String(req.query.url || "").trim();
-    if (!raw) raw = await getSetting("sheet_csv_url", "");
-    if (!raw) return res.status(400).json({ ok: false, error: "Missing 'url' and no saved Sheet URL" });
-
-    let u;
-    try { u = new URL(raw); }
-    catch { return res.status(400).json({ ok: false, error: "Invalid URL" }); }
-
-    if (!["https:", "http:"].includes(u.protocol)) {
-      return res.status(400).json({ ok: false, error: "Only http/https allowed" });
-    }
-    if (!isAllowedSheetsHost(u.hostname)) {
-      return res.status(400).json({ ok: false, error: "URL must be a Google Sheets host" });
-    }
-
-    // Normalize to a CSV export URL
-    const csvUrl = toCsvUrl(u.toString());
-
-    // Use global fetch if available; otherwise lazy-load node-fetch
-    let doFetch = globalThis.fetch;
-    if (typeof doFetch !== "function") {
-      const { default: nodeFetch } = await import("node-fetch");
-      doFetch = nodeFetch;
-    }
-
-    const r = await doFetch(csvUrl, { headers: { Accept: "text/csv, text/plain, */*" } });
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      return res.status(r.status).json({
-        ok: false,
-        error:
-          (txt && txt.slice(0, 200)) ||
-          `Fetch failed (${r.status}). Make sure the Sheet is "File → Share → Publish to the web" or the link is accessible.`,
-      });
-    }
-
-    const csvText = await r.text();
-    const grid = parseSimpleCSV(csvText);
-
-    if (!grid.length) return res.json({ ok: true, headers: [], rows: [], url: csvUrl });
-
-    const headers = grid[0];
-    const rows = grid.slice(1).filter(arr => arr.some(c => String(c).trim() !== ""));
-    return res.json({ ok: true, headers, rows, url: csvUrl });
-  } catch (e) {
-    console.error("[/api/admin/sheets-sync] error:", e);
-    return res.status(500).json({ ok: false, error: "Server error" });
-  }
-});
-
-/**
- * POST /api/admin/sheets-import
- * Body: { url?: string, replace?: boolean }
- * Fetches CSV from saved or provided URL, maps rows, and appends (or replaces) breaches.json
- * (Kept for compatibility, even though live-read mode does not need it.)
- */
-router.post("/sheets-import", async (req, res) => {
-  try {
-    let raw = String(req.body?.url || "").trim();
-    if (!raw) raw = await getSetting("sheet_csv_url", "");
-    if (!raw) return res.status(400).json({ ok: false, error: "No saved Sheet URL and none provided" });
-
-    let u;
-    try { u = new URL(raw); } catch { return res.status(400).json({ ok: false, error: "Invalid URL" }); }
-    if (!["http:", "https:"].includes(u.protocol) || !isAllowedSheetsHost(u.hostname)) {
-      return res.status(400).json({ ok: false, error: "URL must be a Google Sheets link" });
-    }
-
-    const csvUrl = toCsvUrl(u.toString());
-
-    let doFetch = globalThis.fetch;
-    if (typeof doFetch !== "function") {
-      const { default: nodeFetch } = await import("node-fetch");
-      doFetch = nodeFetch;
-    }
-    const r = await doFetch(csvUrl, { headers: { Accept: "text/csv, text/plain, */*" } });
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      return res.status(r.status).json({ ok: false, error: txt || `Fetch failed (${r.status})` });
-    }
-
-    const csvText = await r.text();
-    const grid = parseSimpleCSV(csvText);
-    if (!grid.length) {
-      const existing = await readJson(BREACH_FILE);
-      return res.json({ ok: true, added: 0, total: existing.length });
-    }
-
-    const headers = grid[0];
-    const bodyRows = grid.slice(1).filter(arr => arr.some(c => String(c).trim() !== ""));
-
-    const replace = !!req.body?.replace;
-    const rows = replace ? [] : await readJson(BREACH_FILE);
-    let added = 0;
-    for (const rawRow of bodyRows) {
-      const rec = rowToRecord(headers, rawRow);
-      rows.push(rec);
-      added++;
-      if (added % 5000 === 0) await writeJson(BREACH_FILE, rows);
-    }
-    await writeJson(BREACH_FILE, rows);
-    res.json({ ok: true, added, total: rows.length });
-  } catch (e) {
-    console.error("[/sheets-import] error", e);
-    res.status(500).json({ ok: false, error: "Server error" });
-  }
-});
-/* ===================== end Google Sheets block ===================== */
+/* ===================== end Google Sheets settings block ===================== */
 
 /* ===================== LIVE SHEET BACKEND (READ PATHS) ===================== */
-/** Small, deterministic hash for stable IDs (when Sheet has no explicit id). */
+/** Optional tiny cache. Set LIVE_SHEET_CACHE_MS=0 for truly immediate reads (default 0). */
+const SHEET_CACHE_TTL_MS = Number(process.env.LIVE_SHEET_CACHE_MS ?? "0");
+let sheetCache = { url: "", fetchedAt: 0, rows: [] };
+
 function hashId(str) {
   let h = 5381;
   for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
-  // return short hex
   return (h >>> 0).toString(16);
 }
-
-/** Map a CSV row to your record shape, ensuring a stable ID if Sheet lacks one. */
 function sheetRowToRecord(headers, values) {
   const rec = rowToRecord(headers, values);
-  if (!rec.id || /^\d?\.\w+/.test(rec.id)) {
+  if (!rec.id) {
     const stableKey = [
       rec.name || "",
       rec.email || "",
@@ -439,22 +323,16 @@ function sheetRowToRecord(headers, values) {
   return rec;
 }
 
-/** cache for live sheet fetches to avoid overfetching */
-const SHEET_CACHE_TTL_MS = 60 * 1000; // 60s cache
-let sheetCache = { url: "", fetchedAt: 0, rows: [] };
-
 async function fetchSheetRowsMapped() {
   const saved = await getSetting("sheet_csv_url", "");
-  if (!saved) return null; // signal: no live sheet configured
+  if (!saved) return null;
   const url = toCsvUrl(saved);
   const now = Date.now();
 
-  // valid cache?
-  if (sheetCache.url === url && now - sheetCache.fetchedAt < SHEET_CACHE_TTL_MS) {
+  if (SHEET_CACHE_TTL_MS > 0 && sheetCache.url === url && now - sheetCache.fetchedAt < SHEET_CACHE_TTL_MS) {
     return sheetCache.rows;
   }
 
-  // fetch
   let doFetch = globalThis.fetch;
   if (typeof doFetch !== "function") {
     const { default: nodeFetch } = await import("node-fetch");
@@ -462,50 +340,46 @@ async function fetchSheetRowsMapped() {
   }
 
   const r = await doFetch(url, { headers: { Accept: "text/csv, text/plain, */*" } });
-  if (!r.ok) {
-    // don't throw; fallback will handle
-    return null;
-  }
+  if (!r.ok) return null;
+
   const csvText = await r.text();
   const grid = parseSimpleCSV(csvText);
   if (!grid.length) {
-    sheetCache = { url, fetchedAt: now, rows: [] };
+    if (SHEET_CACHE_TTL_MS > 0) sheetCache = { url, fetchedAt: now, rows: [] };
     return [];
   }
   const headers = grid[0];
   const bodyRows = grid.slice(1).filter(arr => arr.some(c => String(c).trim() !== ""));
   const mapped = bodyRows.map(row => sheetRowToRecord(headers, row));
 
-  sheetCache = { url, fetchedAt: now, rows: mapped };
+  if (SHEET_CACHE_TTL_MS > 0) sheetCache = { url, fetchedAt: now, rows: mapped };
   return mapped;
 }
 
-/** Main data accessor for READ paths. Prefers live Sheet; falls back to local JSON. */
 async function getDataRows() {
   try {
     const live = await fetchSheetRowsMapped();
-    if (Array.isArray(live)) return live; // sheet mode
+    if (Array.isArray(live)) return live; // live Sheet backend
   } catch (e) {
     console.warn("[getDataRows] live sheet fetch failed; falling back to JSON:", e?.message);
   }
-  // fallback: local JSON file behavior (legacy)
+  // Fallback: local JSON (legacy)
   return await readJson(BREACH_FILE);
 }
 
-/* ---------- list / search / detail / delete ---------- */
+/* ---------- list / search / detail / delete (READ use live Sheet) ---------- */
 router.get("/breach-records", async (req, res) => {
   const limit = Math.min(parseInt(String(req.query.limit || "500"), 10) || 500, 5000);
   const offset = Math.max(parseInt(String(req.query.offset || "0"), 10) || 0, 0);
   let rows = await getDataRows();
 
-  // Ensure every row has a stable 'id' (legacy JSON rows)
+  // Ensure ID for legacy JSON rows (Sheet rows already have stable ids)
   let assigned = 0;
   rows = rows.map(r => {
     if (r && (r.id || r.ID)) return r;
     const id = "j_" + Math.random().toString(36).slice(2, 10);
     assigned++;
     return { id, ...r };
-    // NOTE: live sheet path already guarantees stable ids via sheetRowToRecord
   });
   if (assigned > 0) { await writeJson(BREACH_FILE, rows).catch(() => {}); }
 
@@ -522,7 +396,6 @@ router.get("/breach-detail/:id", async (req, res) => {
     if (!Number.isNaN(idx) && idx >= 0 && idx < rows.length) row = rows[idx];
   }
   if (!row) return res.status(404).json({ ok: false, error: "Not found" });
-  // Admin sees raw values
   res.json({
     id: String(row.id ?? ""),
     name: listName(row),
@@ -541,23 +414,20 @@ router.get("/breach-detail/:id", async (req, res) => {
   });
 });
 
-/* ---------- UPDATED: field-aware search with optional type override ---------- */
+/* ---- Field-aware /search with optional type=name|email|phone|address ---- */
 router.get("/search", async (req, res) => {
   const rawQ = String(req.query.q || "").trim();
   const q = rawQ.toLowerCase();
   const rows = await getDataRows();
   if (!q) return res.json(rows.slice(0, 500));
 
-  // helpers
   const s = (v) => (v == null ? "" : String(v)).trim();
   const sl = (v) => s(v).toLowerCase();
   const digits = (v) => s(v).replace(/\D/g, "");
 
-  // explicit type from client (optional)
   const typeParam = String(req.query.type || "").toLowerCase();
   const forcedType = ["name", "email", "phone", "address"].includes(typeParam) ? typeParam : null;
 
-  // auto-detect (back-compat)
   const looksLikeEmail = /.+@.+\..+/.test(rawQ);
   const qDigits = digits(rawQ);
   const looksLikePhone = qDigits.length >= 7;
@@ -576,15 +446,13 @@ router.get("/search", async (req, res) => {
 
   const inEmail = (r) => {
     const fields = [r.email, r.Email, r.PersonalEmail, r.WorkEmail, r.workEmail, r.personalEmail, r.email1, r.email2]
-      .filter(Boolean)
-      .map(sl);
+      .filter(Boolean).map(sl);
     return fields.some((e) => e.includes(q));
   };
 
   const inPhone = (r) => {
     const fields = [r.phone, r.Phone, r.CellPhone, r.WorkPhone, r.HomePhone, r.Mobile]
-      .filter(Boolean)
-      .map(digits);
+      .filter(Boolean).map(digits);
     return fields.some((p) => p.includes(qDigits));
   };
 
@@ -608,7 +476,7 @@ router.get("/search", async (req, res) => {
   res.json(out.slice(0, 2000));
 });
 
-/* ---------- IMPORT/DELETE (kept for compatibility; operate on local JSON) ---------- */
+/* ---------- IMPORT/DELETE (kept; operate on local JSON; not used in live mode) ---------- */
 
 // Multer storage to disk (stream from tmp file)
 const upload = multer({
@@ -619,9 +487,6 @@ const upload = multer({
   },
 });
 
-// POST /api/admin/import
-// - multipart form: {file} -> parse CSV/TSV streaming
-// - application/json: {rows: BreachRecord[]} -> append directly
 router.post("/import", upload.single("file"), async (req, res) => {
   try {
     const rows = await readJson(BREACH_FILE);
@@ -640,15 +505,12 @@ router.post("/import", upload.single("file"), async (req, res) => {
       return res.json({ ok: true, added: incoming.length, total: rows.length });
     }
 
-    // Multipart file path
     const filePath = req.file?.path;
     if (!filePath) return res.status(400).json({ ok: false, error: "No file" });
 
-    // Detect delimiter from first KB
     const firstChunk = fscore.readFileSync(filePath, { encoding: "utf8", flag: "r" }).slice(0, 4096);
     const delimiter = firstChunk.indexOf("\t") >= 0 ? "\t" : ",";
 
-    // Stream parse
     const parser = fscore.createReadStream(filePath).pipe(
       parse({
         delimiter,
@@ -682,7 +544,6 @@ router.post("/import", upload.single("file"), async (req, res) => {
 });
 
 router.get("/breach-records-legacy", async (_req, res) => {
-  // explicit endpoint to read the local JSON, if you ever need it
   const rows = await readJson(BREACH_FILE);
   res.json(rows);
 });
