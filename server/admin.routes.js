@@ -93,6 +93,7 @@ function composeAddress(obj) {
   return parts.join(", ");
 }
 
+/** Original row-to-record used for imports (unchanged) */
 function rowToRecord(header, values) {
   const o = {};
   header.forEach((h, i) => (o[norm(h)] = values[i]));
@@ -358,6 +359,7 @@ router.get("/sheets-sync", async (req, res) => {
  * POST /api/admin/sheets-import
  * Body: { url?: string, replace?: boolean }
  * Fetches CSV from saved or provided URL, maps rows, and appends (or replaces) breaches.json
+ * (Kept for compatibility, even though live-read mode does not need it.)
  */
 router.post("/sheets-import", async (req, res) => {
   try {
@@ -412,27 +414,108 @@ router.post("/sheets-import", async (req, res) => {
 });
 /* ===================== end Google Sheets block ===================== */
 
+/* ===================== LIVE SHEET BACKEND (READ PATHS) ===================== */
+/** Small, deterministic hash for stable IDs (when Sheet has no explicit id). */
+function hashId(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
+  // return short hex
+  return (h >>> 0).toString(16);
+}
+
+/** Map a CSV row to your record shape, ensuring a stable ID if Sheet lacks one. */
+function sheetRowToRecord(headers, values) {
+  const rec = rowToRecord(headers, values);
+  if (!rec.id || /^\d?\.\w+/.test(rec.id)) {
+    const stableKey = [
+      rec.name || "",
+      rec.email || "",
+      rec.phone || "",
+      rec.dob || "",
+      rec.address || ""
+    ].join("|");
+    rec.id = "s_" + hashId(stableKey);
+  }
+  return rec;
+}
+
+/** cache for live sheet fetches to avoid overfetching */
+const SHEET_CACHE_TTL_MS = 60 * 1000; // 60s cache
+let sheetCache = { url: "", fetchedAt: 0, rows: [] };
+
+async function fetchSheetRowsMapped() {
+  const saved = await getSetting("sheet_csv_url", "");
+  if (!saved) return null; // signal: no live sheet configured
+  const url = toCsvUrl(saved);
+  const now = Date.now();
+
+  // valid cache?
+  if (sheetCache.url === url && now - sheetCache.fetchedAt < SHEET_CACHE_TTL_MS) {
+    return sheetCache.rows;
+  }
+
+  // fetch
+  let doFetch = globalThis.fetch;
+  if (typeof doFetch !== "function") {
+    const { default: nodeFetch } = await import("node-fetch");
+    doFetch = nodeFetch;
+  }
+
+  const r = await doFetch(url, { headers: { Accept: "text/csv, text/plain, */*" } });
+  if (!r.ok) {
+    // don't throw; fallback will handle
+    return null;
+  }
+  const csvText = await r.text();
+  const grid = parseSimpleCSV(csvText);
+  if (!grid.length) {
+    sheetCache = { url, fetchedAt: now, rows: [] };
+    return [];
+  }
+  const headers = grid[0];
+  const bodyRows = grid.slice(1).filter(arr => arr.some(c => String(c).trim() !== ""));
+  const mapped = bodyRows.map(row => sheetRowToRecord(headers, row));
+
+  sheetCache = { url, fetchedAt: now, rows: mapped };
+  return mapped;
+}
+
+/** Main data accessor for READ paths. Prefers live Sheet; falls back to local JSON. */
+async function getDataRows() {
+  try {
+    const live = await fetchSheetRowsMapped();
+    if (Array.isArray(live)) return live; // sheet mode
+  } catch (e) {
+    console.warn("[getDataRows] live sheet fetch failed; falling back to JSON:", e?.message);
+  }
+  // fallback: local JSON file behavior (legacy)
+  return await readJson(BREACH_FILE);
+}
+
 /* ---------- list / search / detail / delete ---------- */
 router.get("/breach-records", async (req, res) => {
   const limit = Math.min(parseInt(String(req.query.limit || "500"), 10) || 500, 5000);
   const offset = Math.max(parseInt(String(req.query.offset || "0"), 10) || 0, 0);
-  let rows = await readJson(BREACH_FILE);
-  // Ensure every row has a stable 'id' (for selection/deletion)
+  let rows = await getDataRows();
+
+  // Ensure every row has a stable 'id' (legacy JSON rows)
   let assigned = 0;
   rows = rows.map(r => {
     if (r && (r.id || r.ID)) return r;
-    const id = Math.random().toString(36).slice(2, 10);
+    const id = "j_" + Math.random().toString(36).slice(2, 10);
     assigned++;
     return { id, ...r };
+    // NOTE: live sheet path already guarantees stable ids via sheetRowToRecord
   });
-  if (assigned > 0) { await writeJson(BREACH_FILE, rows); }
+  if (assigned > 0) { await writeJson(BREACH_FILE, rows).catch(() => {}); }
+
   res.setHeader("X-Total-Count", String(rows.length));
   res.json(rows.slice(offset, offset + limit));
 });
 
 router.get("/breach-detail/:id", async (req, res) => {
   const id = String(req.params.id);
-  const rows = await readJson(BREACH_FILE);
+  const rows = await getDataRows();
   let row = rows.find((r) => String(r.id ?? r.ID ?? "").toLowerCase() === id.toLowerCase());
   if (!row) {
     const idx = Number(id);
@@ -458,32 +541,23 @@ router.get("/breach-detail/:id", async (req, res) => {
   });
 });
 
-router.delete("/breach-records/:id", async (req, res) => {
-  const id = String(req.params.id);
-  const rows = await readJson(BREACH_FILE);
-  const next = rows.filter((r) => String(r.id ?? r.ID ?? "") !== id);
-  const deleted = rows.length - next.length;
-  if (deleted > 0) await writeJson(BREACH_FILE, next);
-  res.json({ ok: true, deleted });
-});
-
-/* ---------- UPDATED: field-aware search (name/email/phone/address) ---------- */
+/* ---------- UPDATED: field-aware search with optional type override ---------- */
 router.get("/search", async (req, res) => {
   const rawQ = String(req.query.q || "").trim();
   const q = rawQ.toLowerCase();
-  const rows = await readJson(BREACH_FILE);
+  const rows = await getDataRows();
   if (!q) return res.json(rows.slice(0, 500));
 
   // helpers
   const s = (v) => (v == null ? "" : String(v)).trim();
   const sl = (v) => s(v).toLowerCase();
   const digits = (v) => s(v).replace(/\D/g, "");
-  
-  // NEW: explicit type override from client (optional)
+
+  // explicit type from client (optional)
   const typeParam = String(req.query.type || "").toLowerCase();
   const forcedType = ["name", "email", "phone", "address"].includes(typeParam) ? typeParam : null;
-  
-  // detect intent
+
+  // auto-detect (back-compat)
   const looksLikeEmail = /.+@.+\..+/.test(rawQ);
   const qDigits = digits(rawQ);
   const looksLikePhone = qDigits.length >= 7;
@@ -492,16 +566,12 @@ router.get("/search", async (req, res) => {
     /(st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|pkwy|parkway|apt|suite|unit)\b/i.test(rawQ) ||
     /,\s*[A-Z]{2}\b/.test(rawQ);
 
-  // matchers scoped to relevant fields only
   const inName = (r) => {
     const name = [
       r.name, r.Name, r.employee, r.Employee, r.EmployeeName,
       [r.FirstName, r.MiddleName, r.LastName, r.Suffix].filter(Boolean).join(" ")
     ].filter(Boolean).join(" ");
     return sl(name).includes(q);
-    // If you want exact word match, replace the line above with:
-    // const re = new RegExp(`\\b${q.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
-    // return re.test(name || "");
   };
 
   const inEmail = (r) => {
@@ -538,7 +608,7 @@ router.get("/search", async (req, res) => {
   res.json(out.slice(0, 2000));
 });
 
-/* ---------- IMPORT: multipart files OR JSON rows ---------- */
+/* ---------- IMPORT/DELETE (kept for compatibility; operate on local JSON) ---------- */
 
 // Multer storage to disk (stream from tmp file)
 const upload = multer({
@@ -609,6 +679,21 @@ router.post("/import", upload.single("file"), async (req, res) => {
     console.error("import error", e);
     res.status(500).json({ ok: false, error: "Import failed" });
   }
+});
+
+router.get("/breach-records-legacy", async (_req, res) => {
+  // explicit endpoint to read the local JSON, if you ever need it
+  const rows = await readJson(BREACH_FILE);
+  res.json(rows);
+});
+
+router.delete("/breach-records/:id", async (req, res) => {
+  const id = String(req.params.id);
+  const rows = await readJson(BREACH_FILE);
+  const next = rows.filter((r) => String(r.id ?? r.ID ?? "") !== id);
+  const deleted = rows.length - next.length;
+  if (deleted > 0) await writeJson(BREACH_FILE, next);
+  res.json({ ok: true, deleted });
 });
 
 router.post("/breach-records/bulk-delete", async (req, res) => {
