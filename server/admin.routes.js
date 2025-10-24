@@ -1,4 +1,4 @@
-﻿// server/admin.routes.js  (ESM)
+// server/admin.routes.js  (ESM)
 import express from "express";
 import fs from "fs/promises";
 import fscore from "fs";
@@ -263,12 +263,6 @@ router.delete("/sheets-source", async (_req, res) => {
   }
 });
 
-/**
- * GET /api/admin/sheets-sync?url=...
- * Accepts a Google Sheets link (edit/publish/gviz). Returns { ok, headers, rows } for the Import tab.
- * If ?url is omitted, uses the persisted sheet_csv_url.
- */
-
 /* ---- Aliases for UI: /settings/sheet-url (GET/POST/DELETE) ---- */
 router.get("/settings/sheet-url", async (_req, res) => {
   try {
@@ -307,6 +301,7 @@ router.delete("/settings/sheet-url", async (_req, res) => {
     res.status(500).json({ ok: false, error: "Failed to delete" });
   }
 });
+
 router.get("/sheets-sync", async (req, res) => {
   try {
     let raw = String(req.query.url || "").trim();
@@ -472,14 +467,70 @@ router.delete("/breach-records/:id", async (req, res) => {
   res.json({ ok: true, deleted });
 });
 
+/* ---------- UPDATED: field-aware search (name/email/phone/address) ---------- */
 router.get("/search", async (req, res) => {
-  const q = String(req.query.q || "").toLowerCase().trim();
+  const rawQ = String(req.query.q || "").trim();
+  const q = rawQ.toLowerCase();
   const rows = await readJson(BREACH_FILE);
   if (!q) return res.json(rows.slice(0, 500));
-  const out = rows.filter((r) => {
-    const hay = JSON.stringify(r).toLowerCase();
-    return hay.includes(q);
-  });
+
+  // helpers
+  const s = (v) => (v == null ? "" : String(v)).trim();
+  const sl = (v) => s(v).toLowerCase();
+  const digits = (v) => s(v).replace(/\D/g, "");
+
+  // detect intent
+  const looksLikeEmail = /.+@.+\..+/.test(rawQ);
+  const qDigits = digits(rawQ);
+  const looksLikePhone = qDigits.length >= 7;
+  const looksLikeAddress =
+    /\d/.test(rawQ) ||
+    /(st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|pkwy|parkway|apt|suite|unit)\b/i.test(rawQ) ||
+    /,\s*[A-Z]{2}\b/.test(rawQ);
+
+  // matchers scoped to relevant fields only
+  const inName = (r) => {
+    const name = [
+      r.name, r.Name, r.employee, r.Employee, r.EmployeeName,
+      [r.FirstName, r.MiddleName, r.LastName, r.Suffix].filter(Boolean).join(" ")
+    ].filter(Boolean).join(" ");
+    return sl(name).includes(q);
+    // If you want exact word match, replace the line above with:
+    // const re = new RegExp(`\\b${q.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
+    // return re.test(name || "");
+  };
+
+  const inEmail = (r) => {
+    const fields = [r.email, r.Email, r.PersonalEmail, r.WorkEmail, r.workEmail, r.personalEmail, r.email1, r.email2]
+      .filter(Boolean)
+      .map(sl);
+    return fields.some((e) => e.includes(q));
+  };
+
+  const inPhone = (r) => {
+    const fields = [r.phone, r.Phone, r.CellPhone, r.WorkPhone, r.HomePhone, r.Mobile]
+      .filter(Boolean)
+      .map(digits);
+    return fields.some((p) => p.includes(qDigits));
+  };
+
+  const inAddress = (r) => {
+    const fields = [
+      r.address, r.Address, r.Address1, r.AddressLine1, r.HomeAddress, r.AddressText,
+      [r.City, r.State, r.Zip].filter(Boolean).join(", "),
+      [r.city, r.state, r.zip].filter(Boolean).join(", ")
+    ].filter(Boolean).map(sl);
+    return fields.some((a) => a.includes(q));
+  };
+
+  // choose predicate
+  let predicate;
+  if (looksLikeEmail) predicate = inEmail;
+  else if (looksLikePhone) predicate = inPhone;
+  else if (looksLikeAddress) predicate = inAddress;
+  else predicate = inName;
+
+  const out = rows.filter((r) => predicate(r));
   res.json(out.slice(0, 2000));
 });
 
@@ -572,4 +623,3 @@ router.post("/breach-records/bulk-delete", async (req, res) => {
 });
 
 export default router;
-
