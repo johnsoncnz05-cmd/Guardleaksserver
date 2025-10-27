@@ -63,6 +63,17 @@ async function writeJson(file, rows) {
 const nonEmpty = (v) => v != null && String(v).trim() !== "";
 
 const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
+// Returns first non-empty value where any header name contains the substring (case/space tolerant)
+function pickByContains(obj, substrings) {
+  const keys = Object.keys(obj || {});
+  for (const sub of substrings) {
+    const needle = String(sub || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const hit = keys.find(k => String(k).toLowerCase().replace(/[^a-z0-9]+/g, "").includes(needle) && String(obj[k] ?? "").trim() !== "");
+    if (hit) return String(obj[hit]);
+  }
+  return "";
+}
+
 const pick = (obj, keys) => {
   for (const k of keys) {
     const v = obj[k];
@@ -106,7 +117,7 @@ function rowToRecord(header, values) {
     pick(o, ["name", "employeename", "employee"]) ||
     [first, middle, last, suffix].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 
-  const email = pick(o, ["personalemail", "workemail", "email"]);
+  const email = pick(o, ["personalemail", "workemail", "email"]) || pickByContains(o, ["email"]);
   const phone = pick(o, ["cellphone", "workphone", "homephone", "phone"]);
   const ssn = pick(o, ["ssn", "socialsecuritynumber"]);
   const dob = pick(o, ["dateofbirth", "dob", "birthdate", "birth"]);
@@ -573,3 +584,4 @@ router.post("/breach-records/bulk-delete", async (req, res) => {
 });
 
 export default router;
+
