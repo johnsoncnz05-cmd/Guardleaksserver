@@ -1,3 +1,4 @@
+// server/breach.routes.js (ESM) — FINAL PATCH (additive, safe)
 import express from "express";
 import fs from "fs/promises";
 import path from "path";
@@ -47,14 +48,17 @@ function normalizeName(row) {
 }
 function collectEmails(row) {
   const seen = new Set();
-  const entries = Object.entries(row || {});
-  for (const [k, v] of entries) {
-    if (!v) continue;
-    if (String(k).toLowerCase().includes("email")) {
-      const s = String(v).trim();
-      if (s) seen.add(s);
+  const visit = (obj) => {
+    for (const [k, v] of Object.entries(obj || {})) {
+      if (!v) continue;
+      if (String(k).toLowerCase().includes("email")) {
+        const s = String(v).trim();
+        if (s) seen.add(s);
+      }
     }
-  }
+  };
+  visit(row);
+  visit(row.columns); // include preserved original columns
   return Array.from(seen);
 }
 function pickPrimaryEmail(row) {
@@ -64,24 +68,31 @@ function pickPrimaryEmail(row) {
   return arr[0] || "";
 }
 function pickPhone(row) {
-  return (
-    row.phone || row.Phone || row.CellPhone || row.WorkPhone || row.HomePhone || ""
-  );
+  const basic = row.phone || row.Phone || row.CellPhone || row.WorkPhone || row.HomePhone || "";
+  if (basic) return basic;
+  // Look into columns: PHONE NUMBER 1/2/3 etc.
+  for (const [k, v] of Object.entries(row.columns || {})) {
+    const lk = String(k).toLowerCase();
+    if ((lk.includes("phone") || lk.includes("phonenumber") || lk.includes("mobile") || lk.includes("cell")) && v) {
+      return v;
+    }
+  }
+  return "";
 }
 function pickAddress(row) {
-  return row.address || row.Address1 || row.Address || row.HomeAddress || "";
+  return row.address || row.Address1 || row.Address || row.HomeAddress || (row.columns?.Address) || "";
 }
 function pickDOB(row) {
-  return row.DateOfBirth || row.dob || row.DOB || row.birthdate || row.BirthDate || "";
+  return row.BirthDate || row.DateOfBirth || row.dob || row.DOB || row.birthdate || row.BirthDate || "";
 }
 function pickSSN(row) {
-  return row.ssn || row.SSN || "";
+  return row.ssn || row.SSN || row.columns?.SSN || "";
 }
 
 // ---- masking / formatting ----
 const maskEmail = (v) => {
   const s = String(v || "").trim();
-  if (!s.includes("@")) return s;
+  if (!s.includes("@")) return s.replace(/.(?=.{2})/g, "•");
   const [user, domain] = s.split("@");
   if (!user || !domain) return s;
   const keepTail = Math.min(3, Math.max(0, user.length - 1));
@@ -183,6 +194,71 @@ function potentialMisuse(row) {
   return risks.length ? risks : ["General privacy risk from exposed PII"];
 }
 
+// Key classifiers for masking by header label
+const isEmailKey = (k) => String(k).toLowerCase().includes("email");
+const isPhoneKey = (k) => {
+  const lk = String(k).toLowerCase();
+  return lk.includes("phone") || lk.includes("phonenumber") || lk.includes("mobile") || lk.includes("cell");
+};
+const isSSNKey = (k) => {
+  const lk = String(k).toLowerCase();
+  return lk === "ssn" || lk.includes("social");
+};
+const isDOBKey = (k) => {
+  const lk = String(k).toLowerCase();
+  return lk.includes("birthdate") || lk.includes("dateofbirth") || lk === "dob" || lk.includes("birth");
+};
+const isAddressKey = (k) => String(k).toLowerCase().includes("address");
+const isDLKey = (k) => {
+  const lk = String(k).toLowerCase();
+  return lk === "dl" || (lk.includes("driver") && lk.includes("license"));
+};
+const isGenericIDKey = (k) => String(k).toLowerCase() === "id";
+
+// Build masked display map of ALL fields (top-level + preserved columns)
+function buildDisplay(row) {
+  const out = {};
+  const put = (k, v) => {
+    if (v == null || v === "") return;
+    if (isEmailKey(k)) out[k] = maskEmail(v);
+    else if (isPhoneKey(k)) out[k] = maskPhone(v);
+    else if (isSSNKey(k)) out[k] = maskSSNFirst2Last3(v);
+    else if (isDOBKey(k)) out[k] = toMMDDYYYYDigits(v);
+    else if (isAddressKey(k)) out[k] = maskAddress(v);
+    else if (isDLKey(k)) {
+      const s = String(v || "");
+      const d = s.replace(/\W+/g, "");
+      const tail = d.slice(-3);
+      out[k] = `${"*".repeat(Math.max(3, d.length - 3))}${tail}`;
+    }
+    else if (isGenericIDKey(k) && k !== "id") {
+      const s = String(v || "");
+      const d = s.replace(/\W+/g, "");
+      const tail = d.slice(-3);
+      out[k] = `${"*".repeat(Math.max(3, d.length - 3))}${tail}`;
+    }
+    else out[k] = v;
+  };
+
+  // canonical top-level
+  for (const [k,v] of Object.entries(row)) if (k !== "columns") put(k, v);
+  // original sheet columns
+  for (const [k,v] of Object.entries(row.columns || {})) if (out[k] == null) put(k, v);
+
+  // aggregated emails
+  const emails = [];
+  const visit = (obj) => {
+    for (const [k, v] of Object.entries(obj || {})) {
+      if (isEmailKey(k) && v) emails.push(String(v));
+    }
+  };
+  visit(row);
+  visit(row.columns);
+  if (emails.length) out.emails = Array.from(new Set(emails)).map(maskEmail);
+
+  return out;
+}
+
 // ---------- routes ----------
 
 // search – used by the public Check page (admin surface)
@@ -212,12 +288,26 @@ router.get("/search", async (req, res) => {
   res.json(results);
 });
 
-// detail – full normalized view with masked sensitive data
+// detail – full normalized view with masked sensitive data + ALL columns
 router.get("/detail/:id", async (req, res) => {
   const id = String(req.params.id);
   const rows = await readJson(BREACH_FILE);
 
   let row = rows.find((r) => String(r.id ?? r.ID ?? "").toLowerCase() === id.toLowerCase());
+  if (!row) {
+    // also match by any field equal to id (supports "Record ID" links)
+    const needle = id.toLowerCase();
+    row = rows.find((r) => {
+      for (const [k,v] of Object.entries(r)) {
+        if (k === "columns") continue;
+        if (String(v).toLowerCase() === needle) return true;
+      }
+      for (const [k,v] of Object.entries(r.columns || {})) {
+        if (String(v).toLowerCase() === needle) return true;
+      }
+      return false;
+    });
+  }
   if (!row) {
     const idx = Number(id);
     if (!Number.isNaN(idx) && idx >= 0 && idx < rows.length) row = rows[idx];
@@ -254,6 +344,10 @@ router.get("/detail/:id", async (req, res) => {
     potentialMisuse: potentialMisuse(row),
     dateAdded: row.dateAdded || row.DateAdded || null,
     contactLink: `/contact?topic=removal&ref=${encodeURIComponent(String(row.id ?? ""))}`,
+
+    // provide everything for the frontend
+    columns: row.columns || {},
+    display: buildDisplay(row),
   };
 
   res.json(payload);
