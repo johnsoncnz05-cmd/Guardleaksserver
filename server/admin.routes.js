@@ -63,17 +63,17 @@ async function writeJson(file, rows) {
 const nonEmpty = (v) => v != null && String(v).trim() !== "";
 
 const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
-// Returns first non-empty value where any header name contains the substring (case/space tolerant)
+
+// helper: first non-empty value where header contains substring
 function pickByContains(obj, substrings) {
-  const keys = Object.keys(obj || {});
+  const keys = Object.keys(obj);
   for (const sub of substrings) {
-    const needle = String(sub || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-    const hit = keys.find(k => String(k).toLowerCase().replace(/[^a-z0-9]+/g, "").includes(needle) && String(obj[k] ?? "").trim() !== "");
+    const needle = norm(sub);
+    const hit = keys.find(k => norm(k).includes(needle) && String(obj[k] ?? "").trim() !== "");
     if (hit) return String(obj[hit]);
   }
   return "";
 }
-
 const pick = (obj, keys) => {
   for (const k of keys) {
     const v = obj[k];
@@ -122,7 +122,7 @@ function rowToRecord(header, values) {
   const ssn = pick(o, ["ssn", "socialsecuritynumber"]);
   const dob = pick(o, ["dateofbirth", "dob", "birthdate", "birth"]);
   const address = composeAddress(o) || pick(o, ["address1", "address", "addressline1"]);
-  const id = pick(o, ["id", "employeeid", "mrn"]) || ""; // may be missing in Sheet
+  const id = pick(o, ["id", "employeeid", "mrn", "recordid", "record", "uniqueid", "uid", "rowid"]) || pickByContains(o, ["record id","recordid","id"]) || ""; // may be missing in Sheet
 
   // simple risk
   let risk = "low";
@@ -132,6 +132,9 @@ function rowToRecord(header, values) {
 
   return {
     id, name: name || "(no name)", email, phone, ssn, dob, address,
+    // duplicates to satisfy downstream selectors expecting these keys
+    Email: email, Phone: phone, SSN: ssn, DateOfBirth: dob,
+    PersonalEmail: email, WorkEmail: "",
     riskLevel: risk, dateAdded: new Date().toISOString(), sources: ["Upload"],
   };
 }
