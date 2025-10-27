@@ -104,49 +104,67 @@ function composeAddress(obj) {
   return parts.join(", ");
 }
 
-/** Map a CSV row (normalized header map) into your record shape (for Sheet + imports)
- *  FINAL PATCH: preserve **all** original columns under `columns` so the details page can render them.
- */
+/** Map a CSV row (normalized header map) into your record shape (for Sheet + imports) */
 function rowToRecord(header, values) {
-  // Preserve originals exactly (case and spacing kept)
+  // keep originals exactly for the details page
   const original = {};
   header.forEach((h, i) => (original[h] = values[i]));
 
-  // Normalized for picking
+  // normalized keys (lowercased, symbols removed) for picking
+  const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
   const o = {};
   header.forEach((h, i) => (o[norm(h)] = values[i]));
 
-  const first = pick(o, ["firstname", "first"]);
-  const middle = pick(o, ["middlename", "middle"]);
-  const last = pick(o, ["lastname", "last"]);
+  const nonEmpty = (v) => v != null && String(v).trim() !== "";
+  const pick = (obj, keys) => {
+    for (const k of keys) {
+      if (nonEmpty(obj[k])) return String(obj[k]);
+    }
+    return "";
+  };
+  // first non-empty where header contains substring (e.g., "email", "phone")
+  const pickByContains = (obj, substr) => {
+    const needle = norm(substr);
+    const hit = Object.keys(obj).find((k) => k.includes(needle) && nonEmpty(obj[k]));
+    return hit ? String(obj[hit]) : "";
+  };
+
+  // name from parts or Name
+  const first = pick(o, ["firstname","first"]);
+  const middle = pick(o, ["middlename","middle"]);
+  const last = pick(o, ["lastname","last"]);
   const suffix = pick(o, ["suffix"]);
   const name =
-    pick(o, ["name", "employeename", "employee"]) ||
+    pick(o, ["name","employeename","employee"]) ||
     [first, middle, last, suffix].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 
-  // Emails: accept Email 1/2/3, etc.
-  const email = pick(o, ["personalemail", "workemail", "email"]) || pickByContains(o, ["email"]);
+  // map canonical fields from your headers
+  const email =
+    pick(o, ["personalemail","workemail","email"]) ||
+    pickByContains(o, "email"); // catches "email1/2/3"
 
-  // Phones: accept PHONE NUMBER 1/2/3, etc.
   const phone =
-    pick(o, ["cellphone", "workphone", "homephone", "phone"]) ||
-    pickByContains(o, ["phonenumber", "phone"]);
+    pick(o, ["cellphone","workphone","homephone","phone"]) ||
+    pickByContains(o, "phonenumber") || // "PHONE NUMBER 1/2/3"
+    pickByContains(o, "phone");
 
-  const ssn = pick(o, ["ssn", "socialsecuritynumber"]);
+  const ssn = pick(o, ["ssn","socialsecuritynumber"]);
 
-  const dob = pick(o, ["birthdate", "dateofbirth", "dob", "birth"]);
+  const dob =
+    pick(o, ["birthdate","dateofbirth","dob","birth"]); // "BirthDate" supported
 
   const address =
-    composeAddress(o) || pick(o, ["address1", "address", "addressline1"]);
+    pick(o, ["address","address1","addressline1","homeaddress"]) ||
+    [pick(o,["address"]), pick(o,["city"]), pick(o,["state"]), pick(o,["zip","zipcode","postalcode"])]
+      .filter(Boolean).join(", ");
 
-  // ID variants including "Record ID"
   const id =
-    pick(o, ["id", "employeeid", "mrn", "recordid", "recid"]) ||
-    pickByContains(o, ["record id", "recordid", "rec id"]) ||
-    ""; // may be blank for live Sheet rows; fine
+    pick(o, ["id","recordid","employeeid","mrn"]) ||
+    pickByContains(o, "recordid") || // "Record ID"
+    ""; // can be blank; can be resolved later
 
   const company =
-    pick(o, ["company", "employer"]) || pickByContains(o, "employer");
+    pick(o, ["company","employer"]) || pickByContains(o, "employer");
 
   // simple risk
   let risk = "low";
@@ -155,16 +173,26 @@ function rowToRecord(header, values) {
   else if (hasDOB || (hasEmail && hasPhone)) risk = "medium";
 
   return {
-    id, name: name || "(no name)", email, phone, ssn, dob, address, company,
-    riskLevel: risk, dateAdded: new Date().toISOString(), sources: ["Upload"],
-    // mirrors so any legacy code still reads standard keys
+    id,
+    name: name || "(no name)",
+    email,
+    phone,
+    ssn,
+    dob,
+    address,
+    company,
+    riskLevel: risk,
+    dateAdded: new Date().toISOString(),
+    sources: ["Upload"],
+    // mirrors so old code keeps working
     Email: email || original["Email"] || "",
     PersonalEmail: original["PersonalEmail"] || "",
     WorkEmail: original["WorkEmail"] || "",
-    // *** preserve every original column exactly as in the Sheet ***
+    // *** preserve every original column exactly as in your Sheet ***
     columns: original,
   };
 }
+
 
 /* ---------- health & reviews (light) ---------- */
 router.get("/health", (_req, res) => {
