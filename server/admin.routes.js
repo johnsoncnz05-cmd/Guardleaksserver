@@ -1,4 +1,4 @@
-// server/admin.routes.js  (ESM)
+// server/admin.routes.js  (ESM) — FINAL PATCH (additive, safe)
 import express from "express";
 import fs from "fs/promises";
 import fscore from "fs";
@@ -63,17 +63,17 @@ async function writeJson(file, rows) {
 const nonEmpty = (v) => v != null && String(v).trim() !== "";
 
 const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
-
-// helper: first non-empty value where header contains substring
+// Returns first non-empty value where any header name contains the substring (case/space tolerant)
 function pickByContains(obj, substrings) {
-  const keys = Object.keys(obj);
+  const keys = Object.keys(obj || {});
   for (const sub of substrings) {
-    const needle = norm(sub);
-    const hit = keys.find(k => norm(k).includes(needle) && String(obj[k] ?? "").trim() !== "");
+    const needle = String(sub || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const hit = keys.find(k => String(k).toLowerCase().replace(/[^a-z0-9]+/g, "").includes(needle) && String(obj[k] ?? "").trim() !== "");
     if (hit) return String(obj[hit]);
   }
   return "";
 }
+
 const pick = (obj, keys) => {
   for (const k of keys) {
     const v = obj[k];
@@ -104,8 +104,15 @@ function composeAddress(obj) {
   return parts.join(", ");
 }
 
-/** Map a CSV row (normalized header map) into your record shape (for Sheet + imports) */
+/** Map a CSV row (normalized header map) into your record shape (for Sheet + imports)
+ *  FINAL PATCH: preserve **all** original columns under `columns` so the details page can render them.
+ */
 function rowToRecord(header, values) {
+  // Preserve originals exactly (case and spacing kept)
+  const original = {};
+  header.forEach((h, i) => (original[h] = values[i]));
+
+  // Normalized for picking
   const o = {};
   header.forEach((h, i) => (o[norm(h)] = values[i]));
 
@@ -117,12 +124,29 @@ function rowToRecord(header, values) {
     pick(o, ["name", "employeename", "employee"]) ||
     [first, middle, last, suffix].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 
+  // Emails: accept Email 1/2/3, etc.
   const email = pick(o, ["personalemail", "workemail", "email"]) || pickByContains(o, ["email"]);
-  const phone = pick(o, ["cellphone", "workphone", "homephone", "phone"]);
+
+  // Phones: accept PHONE NUMBER 1/2/3, etc.
+  const phone =
+    pick(o, ["cellphone", "workphone", "homephone", "phone"]) ||
+    pickByContains(o, ["phonenumber", "phone"]);
+
   const ssn = pick(o, ["ssn", "socialsecuritynumber"]);
-  const dob = pick(o, ["dateofbirth", "dob", "birthdate", "birth"]);
-  const address = composeAddress(o) || pick(o, ["address1", "address", "addressline1"]);
-  const id = pick(o, ["id", "employeeid", "mrn", "recordid", "record", "uniqueid", "uid", "rowid"]) || pickByContains(o, ["record id","recordid","id"]) || ""; // may be missing in Sheet
+
+  const dob = pick(o, ["birthdate", "dateofbirth", "dob", "birth"]);
+
+  const address =
+    composeAddress(o) || pick(o, ["address1", "address", "addressline1"]);
+
+  // ID variants including "Record ID"
+  const id =
+    pick(o, ["id", "employeeid", "mrn", "recordid", "recid"]) ||
+    pickByContains(o, ["record id", "recordid", "rec id"]) ||
+    ""; // may be blank for live Sheet rows; fine
+
+  const company =
+    pick(o, ["company", "employer"]) || pickByContains(o, "employer");
 
   // simple risk
   let risk = "low";
@@ -131,11 +155,14 @@ function rowToRecord(header, values) {
   else if (hasDOB || (hasEmail && hasPhone)) risk = "medium";
 
   return {
-    id, name: name || "(no name)", email, phone, ssn, dob, address,
-    // duplicates to satisfy downstream selectors expecting these keys
-    Email: email, Phone: phone, SSN: ssn, DateOfBirth: dob,
-    PersonalEmail: email, WorkEmail: "",
+    id, name: name || "(no name)", email, phone, ssn, dob, address, company,
     riskLevel: risk, dateAdded: new Date().toISOString(), sources: ["Upload"],
+    // mirrors so any legacy code still reads standard keys
+    Email: email || original["Email"] || "",
+    PersonalEmail: original["PersonalEmail"] || "",
+    WorkEmail: original["WorkEmail"] || "",
+    // *** preserve every original column exactly as in the Sheet ***
+    columns: original,
   };
 }
 
@@ -425,6 +452,8 @@ router.get("/breach-detail/:id", async (req, res) => {
       "Monitor credit reports for 90 days",
       "Freeze credit if suspicious activity is detected",
     ],
+    // expose all original columns so the details page can render your headers
+    columns: row.columns || {},
   });
 });
 
