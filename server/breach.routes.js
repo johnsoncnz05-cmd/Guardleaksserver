@@ -46,14 +46,16 @@ function normalizeName(row) {
   return parts.length ? parts.join(" ").replace(/\s+/g, " ").trim() : "(no name)";
 }
 function collectEmails(row) {
-  const raw = [
-    row.email,
-    row.Email,
-    row.PersonalEmail,
-    row.WorkEmail,
-  ].map((x) => (x == null ? "" : String(x).trim()))
-   .filter(Boolean);
-  return Array.from(new Set(raw));
+  const seen = new Set();
+  const entries = Object.entries(row || {});
+  for (const [k, v] of entries) {
+    if (!v) continue;
+    if (String(k).toLowerCase().includes("email")) {
+      const s = String(v).trim();
+      if (s) seen.add(s);
+    }
+  }
+  return Array.from(seen);
 }
 function pickPrimaryEmail(row) {
   const arr = collectEmails(row);
@@ -268,3 +270,4 @@ router.delete("/:id", async (req, res) => {
 });
 
 export default router;
+
