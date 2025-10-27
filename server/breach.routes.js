@@ -215,7 +215,44 @@ const isDLKey = (k) => {
 };
 const isGenericIDKey = (k) => String(k).toLowerCase() === "id";
 
-// Build masked display map of ALL fields (top-level + preserved columns)
+// add near other helpers
+const isEmailKey = (k) => String(k).toLowerCase().includes("email");
+const isPhoneKey = (k) => {
+  const lk = String(k).toLowerCase();
+  return lk.includes("phone") || lk.includes("phonenumber") || lk.includes("mobile") || lk.includes("cell");
+};
+const isSSNKey = (k) => {
+  const lk = String(k).toLowerCase();
+  return lk === "ssn" || lk.includes("social");
+};
+const isDOBKey = (k) => {
+  const lk = String(k).toLowerCase();
+  return lk.includes("birthdate") || lk.includes("dateofbirth") || lk === "dob" || lk.includes("birth");
+};
+const isAddressKey = (k) => String(k).toLowerCase().includes("address");
+const isDLKey = (k) => {
+  const lk = String(k).toLowerCase();
+  return lk === "dl" || lk.includes("driver") && lk.includes("license");
+};
+const isGenericIDKey = (k) => String(k).toLowerCase() === "id";
+
+// add near masking functions
+const maskDL = (v) => {
+  const s = String(v || "");
+  const d = s.replace(/\W+/g, "");
+  if (!d) return s;
+  const tail = d.slice(-3);
+  return `${"*".repeat(Math.max(3, d.length - 3))}${tail}`;
+};
+const maskGenericID = (v) => {
+  const s = String(v || "");
+  const d = s.replace(/\W+/g, "");
+  if (!d) return s;
+  const tail = d.slice(-3);
+  return `${"*".repeat(Math.max(3, d.length - 3))}${tail}`;
+};
+
+// *** REPLACE your buildDisplay with this ***
 function buildDisplay(row) {
   const out = {};
   const put = (k, v) => {
@@ -225,27 +262,17 @@ function buildDisplay(row) {
     else if (isSSNKey(k)) out[k] = maskSSNFirst2Last3(v);
     else if (isDOBKey(k)) out[k] = toMMDDYYYYDigits(v);
     else if (isAddressKey(k)) out[k] = maskAddress(v);
-    else if (isDLKey(k)) {
-      const s = String(v || "");
-      const d = s.replace(/\W+/g, "");
-      const tail = d.slice(-3);
-      out[k] = `${"*".repeat(Math.max(3, d.length - 3))}${tail}`;
-    }
-    else if (isGenericIDKey(k) && k !== "id") {
-      const s = String(v || "");
-      const d = s.replace(/\W+/g, "");
-      const tail = d.slice(-3);
-      out[k] = `${"*".repeat(Math.max(3, d.length - 3))}${tail}`;
-    }
+    else if (isDLKey(k)) out[k] = maskDL(v);
+    else if (isGenericIDKey(k) && k !== "id") out[k] = maskGenericID(v); // mask sheet "ID", not internal id
     else out[k] = v;
   };
 
-  // canonical top-level
+  // top-level first (canonical fields)
   for (const [k,v] of Object.entries(row)) if (k !== "columns") put(k, v);
-  // original sheet columns
+  // original sheet columns (kept exactly as headers)
   for (const [k,v] of Object.entries(row.columns || {})) if (out[k] == null) put(k, v);
 
-  // aggregated emails
+  // aggregated emails array for convenience
   const emails = [];
   const visit = (obj) => {
     for (const [k, v] of Object.entries(obj || {})) {
@@ -258,6 +285,7 @@ function buildDisplay(row) {
 
   return out;
 }
+
 
 // ---------- routes ----------
 
