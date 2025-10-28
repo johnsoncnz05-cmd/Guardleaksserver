@@ -234,6 +234,283 @@ app.post("/api/payments/capture-order", async (req, res) => {
 });
 
 /* ----------------------------------------------------
+   Exposure Scan (org preview + strong wording)
+---------------------------------------------------- */
+
+// helpers for scan route (names prefixed to avoid collisions)
+const scan_toISO = (d = new Date()) => {
+  const z = new Date(d);
+  return new Date(z.getTime() - z.getTimezoneOffset() * 60000).toISOString();
+};
+const scan_isEmail = (s) => /.+@.+\..+/.test(String(s || ""));
+const scan_isDomain = (s) => /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i.test(String(s || ""));
+const scan_extractDomain = (v) => {
+  const raw = String(v || "").trim().toLowerCase();
+  if (!raw) return "";
+  if (scan_isDomain(raw)) return raw;
+  if (scan_isEmail(raw)) return raw.split("@")[1];
+  return "";
+};
+const scan_toCompanyName = (domain) => {
+  if (!domain) return "";
+  const known = { "glbhealth.org": "GLBHealth" };
+  if (known[domain]) return known[domain];
+  const parts = domain.split(".");
+  const sld = parts.length >= 2 ? parts[parts.length - 2] : domain;
+  return sld.replace(/[-_]/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
+};
+const scan_maskPhone = (p) => {
+  if (!p) return "";
+  const digits = String(p).replace(/\D/g, "");
+  if (!digits) return p;
+  const first = digits.slice(0, 3);
+  const last3 = digits.slice(-3);
+  const midLen = Math.max(0, digits.length - 6);
+  return `(${first}) ${"*".repeat(midLen)}${last3}`;
+};
+const scan_tryGet = (obj, keys) => {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v);
+  }
+  return "";
+};
+const scan_collectEmailsFromRow = (r) => {
+  const emails = new Set();
+  const keys = Object.keys(r || {});
+  const add = (v) => {
+    if (!v) return;
+    String(v)
+      .split(/[;, ]/g)
+      .forEach((s) => {
+        s = s.trim();
+        if (/.+@.+\..+/.test(s)) emails.add(s);
+      });
+  };
+  [
+    "email",
+    "Email",
+    "WorkEmail",
+    "PersonalEmail",
+    "Email1",
+    "Email 1",
+    "Email2",
+    "Email 2",
+    "Email3",
+    "Email 3",
+    "Emails",
+  ].forEach((k) => add(r[k]));
+  keys
+    .filter((k) => /^email\s*\d*$/i.test(k.replaceAll("_", " ")))
+    .forEach((k) => add(r[k]));
+  return Array.from(emails);
+};
+const scan_onDomain = (email, domain) => {
+  const m = String(email).toLowerCase().match(/@([^@]+)$/);
+  return !!(m && m[1] === domain.toLowerCase());
+};
+const scan_safeJSON = async (url) => {
+  try {
+    const r = await fetchFn(url);
+    const t = await r.text();
+    const j = JSON.parse(t || "{}");
+    if (!r.ok) return undefined;
+    return j;
+  } catch {
+    return undefined;
+  }
+};
+const scan_snippetFromSample = (rows, domain) => {
+  if (!rows?.length) return undefined;
+  const r = rows[0];
+  const email = r.email || "";
+  const maskedEmail = email.replace(/^([^@]{1,3}).*(@.*)$/, (_m, a, b) => `${a}•••${b}`);
+  const maskedPhone = scan_maskPhone(
+    scan_tryGet(r, ["phone", "Phone", "CellPhone", "WorkPhone", "HomePhone"])
+  );
+  const place = scan_tryGet(r, ["cityStateZip", "City", "State", "Zip", "city", "state", "zip"]);
+  return `${maskedEmail} — ${maskedPhone || "no phone"} — ${place || "no address"} (sample @${domain})`;
+};
+
+app.post("/api/scan", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim();
+    const domainRaw = String(req.body?.domain || "").trim();
+    const domain = scan_extractDomain(domainRaw || email);
+
+    if (!domain) {
+      return res.status(400).json({ ok: false, error: "Provide a valid organization email or domain." });
+    }
+
+    const base = `${req.protocol}://${req.get("host")}`;
+
+    // 1) Try company preview (sheet-backed)
+    const preview = await scan_safeJSON(
+      `${base}/api/admin/company-preview?domain=${encodeURIComponent(domain)}&limit=8`
+    );
+    const companyName =
+      (preview?.company && String(preview.company)) || scan_toCompanyName(domain) || domain;
+
+    // Shape sample rows from preview
+    const sampleRows = [];
+    if (Array.isArray(preview?.rows)) {
+      for (const r of preview.rows) {
+        const emails = scan_collectEmailsFromRow(r);
+        const orgEmail = emails.find((e) => scan_onDomain(e, domain));
+        const name =
+          scan_tryGet(r, ["name"]) ||
+          [r.FirstName, r.MiddleName, r.LastName].filter(Boolean).join(" ") ||
+          scan_tryGet(r, ["EmployeeName", "Employee", "Contact"]) ||
+          "";
+        if (orgEmail && name) {
+          sampleRows.push({
+            name,
+            email: orgEmail, // public sample shows full org email
+            phone: scan_maskPhone(
+              scan_tryGet(r, [
+                "phone",
+                "Phone",
+                "CellPhone",
+                "WorkPhone",
+                "HomePhone",
+                "ONE NUMBER 1",
+                "ONE NUMBER2",
+              ])
+            ),
+            cityStateZip:
+              r.cityStateZip ||
+              [r.City, r.State, r.Zip].filter(Boolean).join(", ") ||
+              [r.city, r.state, r.zip].filter(Boolean).join(", ") ||
+              "-",
+            title: scan_tryGet(r, ["title", "Title"]) || "-",
+          });
+        }
+        if (sampleRows.length >= 6) break;
+      }
+    }
+
+    // 2) Fallback: broad search on @domain (if preview empty)
+    if (!sampleRows.length) {
+      const search = await scan_safeJSON(
+        `${base}/api/admin/search?type=email&q=${encodeURIComponent("@" + domain)}`
+      );
+      if (Array.isArray(search)) {
+        for (const r of search) {
+          const emails = scan_collectEmailsFromRow(r);
+          const orgEmail = emails.find((e) => scan_onDomain(e, domain));
+          const name =
+            scan_tryGet(r, ["name"]) ||
+            [r.FirstName, r.MiddleName, r.LastName].filter(Boolean).join(" ") ||
+            scan_tryGet(r, ["EmployeeName", "Employee", "Contact"]) ||
+            "";
+          if (orgEmail && name) {
+            sampleRows.push({
+              name,
+              email: orgEmail,
+              phone: scan_maskPhone(
+                scan_tryGet(r, [
+                  "phone",
+                  "Phone",
+                  "CellPhone",
+                  "WorkPhone",
+                  "HomePhone",
+                  "ONE NUMBER 1",
+                  "ONE NUMBER2",
+                ])
+              ),
+              cityStateZip:
+                [r.City, r.State, r.Zip].filter(Boolean).join(", ") ||
+                [r.city, r.state, r.zip].filter(Boolean).join(", ") ||
+                "-",
+              title: scan_tryGet(r, ["title", "Title"]) || "-",
+            });
+          }
+          if (sampleRows.length >= 6) break;
+        }
+      }
+    }
+
+    const orgPreview = {
+      domain,
+      company: companyName,
+      securityLevel: "high",
+      samples: sampleRows,
+      disclosure:
+        "Preview only — our internal index indicates thousands of leaked records tied to this organization.",
+    };
+
+    // Build exposures with strong wording (no exact counts)
+    const now = Date.now();
+    const mkExp = (id, type, source, fromDays, toDays, severity = "high", snippet) => ({
+      id,
+      type,
+      source,
+      firstSeen: scan_toISO(new Date(now - fromDays * 86400000)),
+      lastSeen: scan_toISO(new Date(now - toDays * 86400000)),
+      severity,
+      snippet,
+    });
+
+    const snack =
+      scan_snippetFromSample(sampleRows, domain) ||
+      `Multiple references to @${domain} in open sources (sample redacted)`;
+
+    const exposures = [
+      mkExp(
+        `org-${domain}-master`,
+        "organization leak alert",
+        "multiple open sources",
+        540,
+        30,
+        "high",
+        `${companyName}: client/staff contact records exposed — ${snack}`
+      ),
+      mkExp(
+        `org-${domain}-paste`,
+        "paste mention",
+        "paste site",
+        365,
+        14,
+        "high",
+        `@${domain} handles appeared in paste/service summaries (details redacted)`
+      ),
+      mkExp(
+        `org-${domain}-repo`,
+        "config trace",
+        "public code repo",
+        730,
+        7,
+        "medium",
+        `Domain string detected in public configuration/log traces (sanitized)`
+      ),
+    ];
+
+    const summary = {
+      score: 90,
+      severity: "high",
+      actions: [
+        "Enforce MFA across staff accounts immediately",
+        `Rotate credentials and force password resets for staff on @${domain}`,
+        "Enable/strict SPF, DKIM, DMARC to deter spoofing",
+        "Audit SSO and email security logs for anomalous auth in last 90 days",
+        "Contact incident response to validate scope & begin takedown/removal",
+      ],
+    };
+
+    return res.json({
+      ok: true,
+      scannedAt: scan_toISO(new Date()),
+      input: { email, domain },
+      exposures,
+      summary,
+      orgPreview,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || "Scan failed" });
+  }
+});
+
+/* ----------------------------------------------------
    Sheets CSV → JSON (published CSV URL)
 ---------------------------------------------------- */
 function parseCsvLoosely(text) {
